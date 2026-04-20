@@ -150,18 +150,29 @@ This repository version was checked against the current GT mainline and validate
 
 - CLI help check
 - Python syntax compilation
-- standalone smoke run from the `code/` entrypoint
+- standalone end-to-end evaluation from the `code/` entrypoint
 
-The validated standalone smoke result matched the current mainline behavior on:
+The current validated standalone run uses:
 
-- CheXpert: `+0.0233`
-- MIMIC: `+0.0024`
-- COVID: `+0.0259`
-- RSNA: `+0.0953`
+- label space: `chexpert5`
+- source order profile: `chexpert5_reordered_200x5`
+- cache mode: `off`
+
+The main comparison is the frozen BioMedCLIP zero-shot baseline versus the `CAPAv1-GT` aligned model:
+
+| Dataset | BioMedCLIP Baseline | CAPAv1-GT | Delta |
+| --- | ---: | ---: | ---: |
+| CheXpert | `0.5950` | `0.6183` | `+0.0233` |
+| MIMIC | `0.5921` | `0.5945` | `+0.0024` |
+| COVID | `0.7907` | `0.8166` | `+0.0259` |
+| RSNA | `0.6811` | `0.7764` | `+0.0953` |
+
+These numbers come from the validated standalone evaluation run of this repository, not from the larger workspace wrapper.
 
 ## Notes
 
-- This repository intentionally exposes a single cleaned mainline rather than multiple historical branches.
-- OT is not part of this engineering package.
-- Cache is treated as an evaluation-time optional expert, not as an always-on enhancement.
-- The code is optimized for reproducibility and clarity over preserving older exploratory branches.
+- This repository exposes one supported experiment path only: the cleaned `CAPAv1-GT` mainline.
+- Older historical branches and exploratory variants are intentionally not included here.
+- OT is not included in this engineering package.
+- Cache is available only as an optional evaluation-time expert and is `off` by default.
+- The goal of this repository is a clear, reproducible implementation of the current experiment, not a full archive of every earlier ablation.
