@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import os
+from typing import List, Optional
 
 import numpy as np
 import torch
@@ -10,11 +11,60 @@ from .config import CAPA5Config
 from .runner import CAPAExperimentRunner
 
 
-def main() -> int:
-    import argparse
+def _parse_float_csv(value: Optional[str]) -> Optional[List[float]]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    parts = [part.strip() for part in text.split(",") if part.strip()]
+    if not parts:
+        return None
+    return [float(part) for part in parts]
 
-    parser = argparse.ArgumentParser(description="CAPA main runner")
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="CAPAv1-GT clean engineering runner")
     parser.add_argument("--debug", action="store_true", help="Enable detailed debug prints.")
+    parser.add_argument(
+        "--param-profile",
+        type=str,
+        default="default",
+        choices=["default", "professor"],
+        help="Parameter strategy profile: original defaults or professor-style auto rules.",
+    )
+    parser.add_argument(
+        "--label-space",
+        type=str,
+        default="chexpert5",
+        choices=["14", "chexpert5", "unified5"],
+        help="Internal semantic label space used end-to-end.",
+    )
+    parser.add_argument(
+        "--source-label-order-profile",
+        type=str,
+        default="chexpert5_reordered_200x5",
+        choices=["default", "chexpert5_reordered_200x5"],
+        help="How to interpret source label order when a file does not store class_names.",
+    )
+    parser.add_argument(
+        "--init-temperature",
+        type=float,
+        default=None,
+        help="Override INIT_TEMPERATURE used for default evaluation/calibration.",
+    )
+    parser.add_argument(
+        "--init-scale",
+        type=float,
+        default=None,
+        help="Override INIT_SCALE_FACTOR used for logits.",
+    )
+    parser.add_argument(
+        "--min-classes-adapt",
+        type=int,
+        default=None,
+        help="Override MIN_CLASSES_FOR_ADAPTATION gate.",
+    )
     parser.add_argument(
         "--scoring-mode",
         type=str,
@@ -35,54 +85,60 @@ def main() -> int:
         help="Run manuscript validation in both mixed and softmax modes and print a comparison table.",
     )
     parser.add_argument(
-        "--ot",
+        "--cache-mode",
         type=str,
-        default="on",
-        choices=["on", "off"],
-        help="Enable/disable OT(Sinkhorn)-based text prototype remapping before Procrustes.",
+        default="off",
+        choices=["off", "gated"],
+        help="Cache policy for evaluation: off or gated expert.",
     )
     parser.add_argument(
-        "--ot-eps",
+        "--cache-alpha-max",
         type=float,
-        default=0.08,
-        help="Sinkhorn epsilon for OT remapping.",
-    )
-    parser.add_argument(
-        "--ot-alpha",
-        type=float,
-        default=0.08,
-        help="Identity blend alpha in [0,1]: 0=pure OT text, 1=original text.",
-    )
-    parser.add_argument(
-        "--ot-iters",
-        type=int,
-        default=100,
-        help="Sinkhorn iterations for OT remapping.",
-    )
-    parser.add_argument(
-        "--capa-cache",
-        type=str,
-        default="on",
-        choices=["on", "off"],
-        help="Enable/disable CAPA+Cache path during evaluation.",
-    )
-    parser.add_argument(
-        "--cache-alpha",
-        type=float,
-        default=0.3,
-        help="Blend alpha for CAPA+Cache logits.",
+        default=0.10,
+        help="Maximum sample-wise cache blend alpha.",
     )
     parser.add_argument(
         "--cache-topk",
         type=int,
-        default=48,
-        help="Top-K nearest neighbors for cache logits.",
+        default=16,
+        help="Top-K nearest neighbors for cache expert.",
     )
     parser.add_argument(
         "--cache-temp",
         type=float,
-        default=0.05,
+        default=0.08,
         help="Softmax temperature for cache neighbor weighting.",
+    )
+    parser.add_argument(
+        "--cache-dataset-psi-thr",
+        type=float,
+        default=0.25,
+        help="Dataset-level PSI threshold; cache is disabled for the whole dataset above this drift level.",
+    )
+    parser.add_argument(
+        "--cache-min-sim-q",
+        type=float,
+        default=0.25,
+        help="Reference quantile used to derive sample-level minimum top1 similarity.",
+    )
+    parser.add_argument(
+        "--cache-min-purity-q",
+        type=float,
+        default=0.50,
+        help="Reference quantile used to derive sample-level minimum neighbor purity.",
+    )
+    parser.add_argument(
+        "--cache-max-entropy-q",
+        type=float,
+        default=0.75,
+        help="Reference quantile used to derive sample-level maximum cache entropy.",
+    )
+    parser.add_argument(
+        "--cache-require-agree",
+        type=str,
+        default="on",
+        choices=["on", "off"],
+        help="Require cache top1 to agree with the base model before cache can contribute.",
     )
     parser.add_argument(
         "--kappa0",
@@ -91,10 +147,10 @@ def main() -> int:
         help="vMF shrink strength for centroid EMA update.",
     )
     parser.add_argument(
-        "--n-min-hpq",
+        "--n-min-support",
         type=int,
         default=8,
-        help="Minimum HPQ support per class to join C_tau (Procrustes/gate).",
+        help="Minimum true support per class to join C_tau (Procrustes/gate).",
     )
     parser.add_argument(
         "--n-cap",
@@ -183,6 +239,12 @@ def main() -> int:
         type=float,
         default=1.0,
         help="Lambda for CAPA-baseline soft fusion.",
+    )
+    parser.add_argument(
+        "--guarded-alphas",
+        type=str,
+        default=None,
+        help="Comma-separated guarded alpha candidates for GT soft fallback, e.g. 1.0,0.85,0.7,0.55,0.4",
     )
     parser.add_argument(
         "--go-guardian",
@@ -284,24 +346,49 @@ def main() -> int:
         default=None,
         help="Optional output directory. If omitted, use config default SAVE_DIR.",
     )
-    args = parser.parse_args()
+    return parser
 
-    config = CAPA5Config(
+
+def build_config(args: argparse.Namespace) -> CAPA5Config:
+    base_cfg = CAPA5Config(
+        LABEL_SPACE=str(args.label_space),
+        PARAM_PROFILE=str(args.param_profile),
+        SOURCE_LABEL_ORDER_PROFILE=str(args.source_label_order_profile),
+    )
+    guarded_alphas_override = _parse_float_csv(args.guarded_alphas)
+    return CAPA5Config(
+        PARAM_PROFILE=str(args.param_profile),
+        LABEL_SPACE=str(args.label_space),
+        SOURCE_LABEL_ORDER_PROFILE=str(args.source_label_order_profile),
         DEBUG=bool(args.debug),
         VERBOSE=bool(args.debug),
         PRINT_SUMMARY=False,
+        INIT_TEMPERATURE=(
+            float(args.init_temperature)
+            if args.init_temperature is not None
+            else float(base_cfg.INIT_TEMPERATURE)
+        ),
+        INIT_SCALE_FACTOR=(
+            float(args.init_scale) if args.init_scale is not None else float(base_cfg.INIT_SCALE_FACTOR)
+        ),
+        MIN_CLASSES_FOR_ADAPTATION=(
+            max(1, int(args.min_classes_adapt))
+            if args.min_classes_adapt is not None
+            else int(base_cfg.MIN_CLASSES_FOR_ADAPTATION)
+        ),
         SCORING_MODE=str(args.scoring_mode),
         SIM_SOURCE=str(args.sim_source),
-        ENABLE_OT_PROTOTYPE_MIXING=(str(args.ot).lower() == "on"),
-        OT_SINKHORN_EPS=max(1e-4, float(args.ot_eps)),
-        OT_IDENTITY_BLEND=min(1.0, max(0.0, float(args.ot_alpha))),
-        OT_SINKHORN_ITERS=max(1, int(args.ot_iters)),
-        ENABLE_CAPA_CACHE=(str(args.capa_cache).lower() == "on"),
-        CACHE_ALPHA=min(1.0, max(0.0, float(args.cache_alpha))),
+        CACHE_MODE=str(args.cache_mode),
+        CACHE_ALPHA_MAX=min(1.0, max(0.0, float(args.cache_alpha_max))),
         CACHE_TOPK=max(1, int(args.cache_topk)),
         CACHE_TEMP=max(1e-4, float(args.cache_temp)),
+        CACHE_DATASET_PSI_THR=max(0.0, float(args.cache_dataset_psi_thr)),
+        CACHE_MIN_SIM_Q=min(1.0, max(0.0, float(args.cache_min_sim_q))),
+        CACHE_MIN_PURITY_Q=min(1.0, max(0.0, float(args.cache_min_purity_q))),
+        CACHE_MAX_ENTROPY_Q=min(1.0, max(0.0, float(args.cache_max_entropy_q))),
+        CACHE_REQUIRE_AGREE=(str(args.cache_require_agree).lower() == "on"),
         KAPPA0=max(0.0, float(args.kappa0)),
-        N_MIN_HPQ_FOR_ACTIVE=max(1, int(args.n_min_hpq)),
+        N_MIN_SUPPORT_FOR_ACTIVE=max(1, int(args.n_min_support)),
         N_CAP=max(1, int(args.n_cap)),
         GAMMA_WEIGHT=max(0.0, float(args.gamma_weight)),
         BETA_WEIGHT=max(0.0, float(args.beta_weight)),
@@ -316,6 +403,11 @@ def main() -> int:
         GATE_MAX_OFFDIAG_DELTA=float(args.gate_max_offdiag_delta),
         ENABLE_CAPA_BASELINE_SOFT_FUSION=(str(args.soft_fusion).lower() == "on"),
         CAPA_BASELINE_FUSION_LAMBDA=min(1.0, max(0.0, float(args.soft_fusion_lambda))),
+        CAPAV1_GUARDED_ALPHAS=(
+            guarded_alphas_override
+            if guarded_alphas_override is not None
+            else list(base_cfg.CAPAV1_GUARDED_ALPHAS)
+        ),
         ENABLE_GO_GUARDIAN=(str(args.go_guardian).lower() == "on"),
         GO_PSI_WINDOW=max(16, int(args.go_psi_window)),
         GO_PSI_BINS=max(5, int(args.go_psi_bins)),
@@ -330,8 +422,14 @@ def main() -> int:
         GO_ML_COND_TARGET=max(1.01, float(args.go_ml_cond_target)),
         GO_ML_USE_RESIDUAL_NORM_WEIGHT=(str(args.go_ml_residual_norm).lower() == "on"),
         GO_ML_SIGNAL_USE_ORIGINAL=(str(args.go_ml_signal).lower() == "original"),
-        SAVE_DIR=(str(args.save_dir) if args.save_dir else CAPA5Config().SAVE_DIR),
+        SAVE_DIR=(str(args.save_dir) if args.save_dir else base_cfg.SAVE_DIR),
     )
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+    config = build_config(args)
     runner = CAPAExperimentRunner(config)
 
     if config.VERBOSE:
@@ -340,40 +438,40 @@ def main() -> int:
             if not os.path.exists(path):
                 print(f"  [WARN] Missing path: {path}")
                 continue
-            z, y, is_multi = runner._load_data(path, is_calibration=('calib' in path.lower()))
-            D = z.shape[1]
-            print(f"  {os.path.basename(path)} -> N={len(z)}, D={D}, labels_present={y is not None}, multi={is_multi}")
+            z, y, is_multi = runner._load_data(path, is_calibration=("calib" in path.lower()))
+            dim = z.shape[1]
+            print(f"  {os.path.basename(path)} -> N={len(z)}, D={dim}, labels_present={y is not None}, multi={is_multi}")
 
     runner._build_prototypes()
     if config.VERBOSE:
         print("  prototypes raw/processed shapes:", runner.t_raw_pooled_raw.shape, runner.t_raw_pooled.shape)
         assert runner.t_raw_pooled.shape == runner.t_raw_pooled_raw.shape
 
-    # Ensure minimal state for diagnostics
-    if runner.class_counts_hpq is None:
-        runner.class_counts_hpq = torch.ones(len(runner.config.ORDERED_CLASS_NAMES), device=runner.device) * runner.config.N_MIN_HPQ_FOR_ACTIVE
+    if runner.support_counts is None:
+        runner.support_counts = (
+            torch.ones(len(runner.config.ORDERED_CLASS_NAMES), device=runner.device)
+            * runner.config.N_MIN_SUPPORT_FOR_ACTIVE
+        )
     if runner.image_centroids is None:
         runner.image_centroids = runner.t_raw_pooled.clone()
     if runner.current_R is None:
         runner.current_R = torch.eye(runner.t_raw_pooled.shape[1], device=runner.device)
 
     if config.VERBOSE and runner.W_zca is not None:
-        WT = runner.W_zca.cpu().numpy()
-        I_approx = WT @ np.linalg.pinv(WT)
-        print("  ZCA approx identity max_err:", np.max(np.abs(I_approx - np.eye(I_approx.shape[0]))))
+        wt = runner.W_zca.cpu().numpy()
+        i_approx = wt @ np.linalg.pinv(wt)
+        print("  ZCA approx identity max_err:", np.max(np.abs(i_approx - np.eye(i_approx.shape[0]))))
 
-    d = runner.t_raw_pooled.shape[1]
-    I = torch.eye(d, device=runner.device)
+    dim = runner.t_raw_pooled.shape[1]
+    eye = torch.eye(dim, device=runner.device)
     if config.VERBOSE:
-        Rtest = runner._solve_procrustes()
-        ortho_err = torch.norm(Rtest @ Rtest.T - I).item()
+        rtest = runner._solve_procrustes()
+        ortho_err = torch.norm(rtest @ rtest.T - eye).item()
         print("  Procrustes R ortho_err:", ortho_err)
         assert ortho_err < 1e-3, "Procrustes R not sufficiently orthogonal"
 
-    # Run full pipeline to freeze R and save state
     runner.run_pipeline()
 
-    # Final manuscript validation with locked scales/priors and plotting
     if args.compare_softmax:
         rows_mixed = runner.run_manuscript_validation(scoring_mode="mixed", sim_source=config.SIM_SOURCE)
         rows_softmax = runner.run_manuscript_validation(scoring_mode="softmax", sim_source=config.SIM_SOURCE)
@@ -393,3 +491,6 @@ def main() -> int:
         if args.compare_per_dataset_capa:
             runner.run_shared_vs_per_dataset_capa(final_rows, scoring_mode=config.SCORING_MODE)
     return 0
+
+
+__all__ = ["main", "CAPA5Config", "CAPA5NotebookRunner", "CAPAExperimentRunner"]

@@ -1,9 +1,32 @@
 from __future__ import annotations
 
-from typing import List
+from .mainline import (
+    BINARY_POSITIVE_CLASS_MAP_14,
+    BINARY_POSITIVE_CLASS_MAP_5,
+    BINARY_POSITIVE_CLASS_MAP_CHEXPERT5,
+    CHEXPERT5_REORDERED_ACTIVE_INDEX_TO_LABEL,
+    CHEXPERT5_REORDERED_SOURCE_ORDER_14,
+    CHEXPERT_5_CLASS_NAMES,
+    FULL_14_CLASS_NAMES,
+    MEDICAL_SYNONYM_MAP_14,
+    MEDICAL_SYNONYM_MAP_5,
+    MEDICAL_SYNONYM_MAP_CHEXPERT5,
+    UNIFIED_5_CLASS_NAMES,
+)
 
-PROTOTYPE_LABEL_SPACE: List[str] = [
-    "Atelectasis", "Cardiomegaly", "Consolidation", "Edema", "Pleural Effusion",
-    "Pneumonia", "Pneumothorax", "Fracture", "Lung Lesion", "Lung Opacity",
-    "Pleural Other", "Enlargement of the Cardiac Silhouette", "Pneumoperitoneum", "Support Devices",
+PROTOTYPE_LABEL_SPACE = list(FULL_14_CLASS_NAMES)
+
+__all__ = [
+    "PROTOTYPE_LABEL_SPACE",
+    "FULL_14_CLASS_NAMES",
+    "CHEXPERT_5_CLASS_NAMES",
+    "CHEXPERT5_REORDERED_ACTIVE_INDEX_TO_LABEL",
+    "CHEXPERT5_REORDERED_SOURCE_ORDER_14",
+    "UNIFIED_5_CLASS_NAMES",
+    "MEDICAL_SYNONYM_MAP_CHEXPERT5",
+    "MEDICAL_SYNONYM_MAP_14",
+    "MEDICAL_SYNONYM_MAP_5",
+    "BINARY_POSITIVE_CLASS_MAP_CHEXPERT5",
+    "BINARY_POSITIVE_CLASS_MAP_14",
+    "BINARY_POSITIVE_CLASS_MAP_5",
 ]

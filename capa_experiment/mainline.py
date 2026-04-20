@@ -1,0 +1,4404 @@
+﻿import os
+import warnings
+import copy
+from pathlib import Path
+# ---- Performance / stability guards for sklearn / MKL on Windows ----
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("MKL_SERVICE_FORCE_INTEL", "1")
+# ---------------------------------------------------------------------
+import pickle
+import random
+import sys
+from datetime import datetime
+import numpy as np
+import pandas as pd 
+import torch
+import torch.nn.functional as F
+import open_clip
+import matplotlib.pyplot as plt
+from typing import Dict, List, Tuple, Optional
+from scipy.optimize import minimize
+from scipy.special import logsumexp
+from scipy.stats import beta as beta_dist, norm
+from sklearn.metrics import roc_auc_score, f1_score, accuracy_score, roc_curve, auc
+from sklearn.calibration import calibration_curve
+from sklearn.exceptions import UndefinedMetricWarning
+from dataclasses import dataclass, field
+from tqdm import tqdm
+
+# Silence noisy warnings for clean experiment logs (set VERBOSE=True to inspect details)
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+warnings.filterwarnings("ignore", category=UndefinedMetricWarning)
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_MODEL_DIR = PROJECT_ROOT / "model"
+DEFAULT_DATA_DIR = PROJECT_ROOT / "data"
+DEFAULT_RESULTS_DIR = PROJECT_ROOT / "results"
+
+FULL_14_CLASS_NAMES = [
+    "Atelectasis", "Cardiomegaly", "Consolidation", "Edema", "Pleural Effusion",
+    "Pneumonia", "Pneumothorax", "Fracture", "Lung Lesion", "Lung Opacity",
+    "Pleural Other", "Enlargement of the Cardiac Silhouette", "Pneumoperitoneum", "Support Devices",
+]
+CHEXPERT_5_CLASS_NAMES = [
+    "Atelectasis", "Cardiomegaly", "Consolidation", "Edema", "Pleural Effusion",
+]
+CHEXPERT5_REORDERED_ACTIVE_INDEX_TO_LABEL = {
+    2: "Atelectasis",
+    5: "Cardiomegaly",
+    6: "Edema",
+    8: "Consolidation",
+    10: "Pleural Effusion",
+}
+
+
+def _build_chexpert5_reordered_source_order_14() -> List[str]:
+    order: List[Optional[str]] = [None] * len(FULL_14_CLASS_NAMES)
+    used = set(CHEXPERT5_REORDERED_ACTIVE_INDEX_TO_LABEL.values())
+    for idx, name in CHEXPERT5_REORDERED_ACTIVE_INDEX_TO_LABEL.items():
+        order[idx] = name
+    remaining = [name for name in FULL_14_CLASS_NAMES if name not in used]
+    rem_iter = iter(remaining)
+    for i in range(len(order)):
+        if order[i] is None:
+            order[i] = next(rem_iter)
+    return [str(x) for x in order]
+
+
+CHEXPERT5_REORDERED_SOURCE_ORDER_14 = _build_chexpert5_reordered_source_order_14()
+UNIFIED_5_CLASS_NAMES = [
+    "Consolidation", "Pneumonia", "Pneumothorax", "Lung Lesion", "Pleural Other",
+]
+MEDICAL_SYNONYM_MAP_CHEXPERT5 = {
+    "Atelectasis": ["atelectasis", "collapsed lung tissue"],
+    "Cardiomegaly": ["cardiomegaly", "enlarged heart"],
+    "Consolidation": ["consolidation", "lung consolidation"],
+    "Edema": ["edema", "pulmonary edema", "fluid overload"],
+    "Pleural Effusion": ["pleural effusion", "fluid in pleural space"],
+}
+MEDICAL_SYNONYM_MAP_14 = {
+    "Atelectasis": ["atelectasis", "collapsed lung tissue"],
+    "Cardiomegaly": ["cardiomegaly", "enlarged heart"],
+    "Consolidation": ["consolidation", "lung consolidation"],
+    "Edema": ["edema", "pulmonary edema", "fluid overload"],
+    "Pleural Effusion": ["pleural effusion", "fluid in pleural space"],
+    "Pneumonia": ["pneumonia", "lung infection"],
+    "Pneumothorax": ["pneumothorax", "collapsed lung"],
+    "Fracture": ["fracture", "bone fracture", "rib fracture"],
+    "Lung Lesion": ["lung lesion", "pulmonary nodule", "mass"],
+    "Lung Opacity": ["lung opacity", "white lung"],
+    "Pleural Other": ["pleural abnormality", "pleural thickening"],
+    "Enlargement of the Cardiac Silhouette": ["enlarged cardiac silhouette", "large heart shadow"],
+    "Pneumoperitoneum": ["pneumoperitoneum", "free air under diaphragm"],
+    "Support Devices": ["support devices", "medical tubes", "lines", "pacemaker"],
+}
+MEDICAL_SYNONYM_MAP_5 = {
+    "Consolidation": ["consolidation", "lung consolidation"],
+    "Pneumonia": ["pneumonia", "lung infection"],
+    "Pneumothorax": ["pneumothorax", "collapsed lung"],
+    "Lung Lesion": ["lung lesion", "pulmonary nodule", "mass"],
+    "Pleural Other": ["pleural abnormality", "pleural thickening"],
+}
+BINARY_POSITIVE_CLASS_MAP_14 = {
+    "default": ["Pneumonia"],
+    "COVID": ["Pneumonia"],
+    "RSNA": ["Pneumonia"],
+}
+BINARY_POSITIVE_CLASS_MAP_5 = {
+    "default": ["Pneumonia"],
+    "COVID": ["Consolidation", "Pneumonia"],
+    "RSNA": ["Pneumonia"],
+}
+BINARY_POSITIVE_CLASS_MAP_CHEXPERT5 = {
+    "default": ["Consolidation"],
+    "COVID": ["Consolidation"],
+    "RSNA": ["Consolidation"],
+}
+
+@dataclass
+class CAPA5Config:
+    RANDOM_SEED: int = 42
+    DEVICE: str = "cuda" if torch.cuda.is_available() else "cpu"
+    MODEL_NAME: str = 'hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224'
+    LOCAL_MODEL_PATH: str = str(DEFAULT_MODEL_DIR)
+    DATA_ROOT: str = str(DEFAULT_DATA_DIR)
+    CALIB_DATA_PATH: str = rf"{DATA_ROOT}\CHEXPERT_MIMIC.pkl"
+    TRAIN_DATA_PATH: str = rf"{DATA_ROOT}\data_train.pkl"
+    # Post-hoc temperature scaling should be fit on a held-out calibration set (NOT test sets)
+    TAU_CALIB_DATA_PATH: str = rf"{DATA_ROOT}\CHEXPERT_MIMIC.pkl"
+    TAU_CALIB_FRAC: float = 0.2
+    TAU_CALIB_MAX: int = 5000
+    TAU_CALIB_MIN: int = 2000
+
+    # === Logging ===
+    VERBOSE: bool = False
+    PRINT_SUMMARY: bool = True
+    DEBUG: bool = False
+    SAVE_DIR: str = str(DEFAULT_RESULTS_DIR)
+    AUC_BOOTSTRAP_ROUNDS: int = 1000
+    
+    TEST_DATA_PATHS: Dict[str, str] = field(default_factory=lambda: {
+        "CheXpert": str(DEFAULT_DATA_DIR / "raw_data" / "CheXpert-v1.0-small"),
+        "MIMIC": str(DEFAULT_DATA_DIR / "MIMIC_200x5.pkl"),
+        "COVID": str(DEFAULT_DATA_DIR / "raw_data" / "COVID19-Radiography-Database"),
+        "RSNA": str(DEFAULT_DATA_DIR / "raw_data" / "rsna"),
+    })
+    PARAM_PROFILE: str = "default"
+    LABEL_SPACE: str = "chexpert5"
+    SOURCE_LABEL_ORDER_PROFILE: str = "chexpert5_reordered_200x5"
+    SOURCE_CLASS_NAMES_14: List[str] = field(default_factory=lambda: list(FULL_14_CLASS_NAMES))
+    ORDERED_CLASS_NAMES: List[str] = field(default_factory=list)
+
+    # === GT support + update ===
+    MULTI_LABEL_RIDGE: float = 0.1  
+    KAPPA_EMA: float = 25         
+    
+    # === Warm-up ===
+    WARMUP_BATCHES: int = 50        
+    M: int = 5
+    USE_ZCA_WHITEN: bool = False
+
+
+    
+    # === GO (Guardian + Multi-label residual projection) ===
+    ENABLE_GO_GUARDIAN: bool = False
+    GO_GUARDIAN_SCALAR: str = "top1_conf"
+    GO_PSI_WINDOW: int = 512
+    GO_PSI_BINS: int = 10
+    GO_PSI_THR: float = 2.0
+    GO_TAU_RESUME: float = 1.0
+    GO_RESUME_WINDOWS: int = 3
+    GO_WARMUP_STEPS: int = 50
+    GO_BASELINE_COLLECT_STEPS: int = 50
+    GO_DRY_RUN: bool = False
+    GO_PSI_BASELINE_MAX: int = 5000
+    GO_PSI_EVAL_EVERY: int = 1
+    # Stage-2 (CUSUM/Page-Hinkley) kept optional; not enabled by default.
+    ENABLE_GO_GUARDIAN_STAGE2: bool = False
+
+    ENABLE_GO_MULTILABEL_PROJECTION: bool = True
+    GO_ML_TAU_BASE: float = 1e-2
+    GO_ML_COND_TARGET: float = 1e3
+    GO_ML_USE_RESIDUAL_NORM_WEIGHT: bool = True
+    GO_ML_SIGNAL_USE_ORIGINAL: bool = True
+
+    # === Procrustes & Gating ===
+    KAPPA0: float = 0.0
+    # [鍏抽敭鍙傛暟] 姣忎釜绫诲埆蹇呴』杈惧埌鐨勬渶灏忔牱鏈暟
+    N_MIN_SUPPORT_FOR_ACTIVE: int = 8
+    
+    N_CAP: int = 500            
+    GAMMA_WEIGHT: float = 0.5
+    ALPHA_WEIGHT: float = 1.0
+    BETA_WEIGHT: float = 0.2    
+    EPSILON: float = 0.0005      
+    RHO: float = 0.85           
+    GATE_USE_RHO_QUANTILE: bool = False
+    RHO_QUANTILE: float = 0.70
+    GATE_REQUIRE_OFFDIAG_IMPROVEMENT: bool = False
+    GATE_MAX_OFFDIAG_DELTA: float = 0.0
+    CAPAV1_DYNAMIC_OFFDIAG_FRAC: float = 0.30
+    CAPAV1_RELAXED_GAIN_OFFDIAG_RATIO: float = 2.5
+    CAPAV1_RHO_BYPASS_ACTIVE_MARGIN: int = 2
+    PROCRUSTES_WEIGHT_CAP_MULT: float = 2.0
+    ENABLE_HARD_NEG_PROCRUSTES: bool = False
+    HARD_NEG_BETA: float = 0.15
+    HARD_NEG_TOPK: int = 3
+    HARD_NEG_TEMP: float = 0.07
+    MIN_CLASSES_FOR_ADAPTATION: int = -1
+    
+    INIT_TEMPERATURE: float = 0.590625
+    INIT_SCALE_FACTOR: float = 5.0
+    TAU_PRIOR: float = 0.05
+    SCORING_MODE: str = "mixed"  # "mixed" (default) or "softmax"
+    SIM_SOURCE: str = "gate"  # "gate" or "dataset"
+    TRAIN_BATCH_SIZE: int = 128
+    # Cache is an evaluation-only gated expert, disabled by default.
+    CACHE_MODE: str = "off"  # off | gated
+    CACHE_ALPHA_MAX: float = 0.10
+    CACHE_TOPK: int = 16
+    CACHE_TEMP: float = 0.08
+    CACHE_DATASET_PSI_THR: float = 0.25
+    CACHE_MIN_SIM_Q: float = 0.25
+    CACHE_MIN_PURITY_Q: float = 0.50
+    CACHE_MAX_ENTROPY_Q: float = 0.75
+    CACHE_REQUIRE_AGREE: bool = True
+    CACHE_CHUNK: int = 512
+    CACHE_SELF_MATCH_COS: float = 0.999999
+    ENABLE_CAPA_BASELINE_SOFT_FUSION: bool = True
+    CAPA_BASELINE_FUSION_LAMBDA: float = 1.0
+    CAPAV1_DUALTRACK_CONF_MARGIN: float = 0.02
+    CAPAV1_DUALTRACK_BLEND: float = 0.65
+    CAPAV1_GUARDED_ALPHAS: List[float] = field(default_factory=lambda: [1.0, 0.85, 0.70, 0.55, 0.40, 0.25])
+    CAPAV1_SOFT_FALLBACK_MIN_GAIN: float = 0.03
+    CAPAV1_SOFT_FALLBACK_OFFDIAG_MULT: float = 1.50
+    CAPAV1_GUARDED_DUMP: bool = False
+    CAPAV1_SMALLER_ALPHA_SCORE_TOL: float = 0.015
+    CAPAV1_SMALLER_ALPHA_MIN_GAIN_FRAC: float = 0.40
+    # Professor profile knobs / targets.
+    PROF_TARGET_TOP1: float = 0.75
+    PROF_EPSILON_GAP_PCT: float = 0.015
+    PROF_LAMBDA_MAX: float = 0.1
+    PROF_KAPPA0: float = 40.0
+    PROF_KAPPA_EMA: float = 50.0
+    PROF_PSI_THR: float = 0.25
+    PROF_AUTO_SCALE: bool = False
+    PROF_AUTO_TEMPERATURE: bool = False
+    PROF_AUTO_THRESHOLDS: bool = False
+    PROF_DYNAMIC_EPSILON: bool = False
+    PROF_DYNAMIC_TAU: bool = False
+
+    MEDICAL_SYNONYM_MAP: Dict[str, List[str]] = field(default_factory=dict)
+
+    TEMPLATES_PI: List[str] = field(default_factory=lambda: [
+        "This chest X-ray shows {finding}.",
+        "There is evidence of {finding}.",
+        "Findings consistent with {finding}.",
+        "The image demonstrates {finding}.",
+        "Signs of {finding} are present."
+    ])
+    BINARY_POSITIVE_CLASS_MAP: Dict[str, List[str]] = field(default_factory=dict)
+
+    def __post_init__(self):
+        profile = str(self.PARAM_PROFILE).strip().lower()
+        if profile in ("default", "base", "paper"):
+            self.PARAM_PROFILE = "default"
+        elif profile in ("professor", "prof"):
+            self.PARAM_PROFILE = "professor"
+        else:
+            raise ValueError(f"Unsupported PARAM_PROFILE={self.PARAM_PROFILE}. Use 'default' or 'professor'.")
+
+        label_space = str(self.LABEL_SPACE).strip().lower()
+        if label_space in ("14", "full14", "14label", "14-label"):
+            self.LABEL_SPACE = "14"
+            self.ORDERED_CLASS_NAMES = list(FULL_14_CLASS_NAMES)
+            self.MEDICAL_SYNONYM_MAP = copy.deepcopy(MEDICAL_SYNONYM_MAP_14)
+            self.BINARY_POSITIVE_CLASS_MAP = copy.deepcopy(BINARY_POSITIVE_CLASS_MAP_14)
+            if int(self.MIN_CLASSES_FOR_ADAPTATION) <= 0:
+                self.MIN_CLASSES_FOR_ADAPTATION = 6
+        elif label_space in ("chexpert5", "chexpert-5", "chex5", "c5"):
+            self.LABEL_SPACE = "chexpert5"
+            self.ORDERED_CLASS_NAMES = list(CHEXPERT_5_CLASS_NAMES)
+            self.MEDICAL_SYNONYM_MAP = copy.deepcopy(MEDICAL_SYNONYM_MAP_CHEXPERT5)
+            self.BINARY_POSITIVE_CLASS_MAP = copy.deepcopy(BINARY_POSITIVE_CLASS_MAP_CHEXPERT5)
+            if int(self.MIN_CLASSES_FOR_ADAPTATION) <= 0:
+                self.MIN_CLASSES_FOR_ADAPTATION = 3
+            self.TEST_DATA_PATHS["CheXpert"] = rf"{self.DATA_ROOT}\cheXpert_200x5.pkl"
+            self.TEST_DATA_PATHS["MIMIC"] = rf"{self.DATA_ROOT}\MIMIC_200x5.pkl"
+        elif label_space in ("5", "u5", "unified5", "unified-5", "5label", "5-label"):
+            self.LABEL_SPACE = "unified5"
+            self.ORDERED_CLASS_NAMES = list(UNIFIED_5_CLASS_NAMES)
+            self.MEDICAL_SYNONYM_MAP = copy.deepcopy(MEDICAL_SYNONYM_MAP_5)
+            self.BINARY_POSITIVE_CLASS_MAP = copy.deepcopy(BINARY_POSITIVE_CLASS_MAP_5)
+            if int(self.MIN_CLASSES_FOR_ADAPTATION) <= 0:
+                self.MIN_CLASSES_FOR_ADAPTATION = 3
+        else:
+            raise ValueError(f"Unsupported LABEL_SPACE={self.LABEL_SPACE}. Use '14', 'chexpert5', or 'unified5'.")
+
+        source_profile = str(self.SOURCE_LABEL_ORDER_PROFILE).strip().lower()
+        if source_profile in ("default", "none", ""):
+            self.SOURCE_LABEL_ORDER_PROFILE = "default"
+        elif source_profile in ("chexpert5_reordered_200x5", "chex5_reordered_200x5", "chex5-reordered-200x5"):
+            self.SOURCE_LABEL_ORDER_PROFILE = "chexpert5_reordered_200x5"
+        else:
+            raise ValueError(
+                f"Unsupported SOURCE_LABEL_ORDER_PROFILE={self.SOURCE_LABEL_ORDER_PROFILE}. "
+                "Use 'default' or 'chexpert5_reordered_200x5'."
+            )
+
+        cache_mode = str(getattr(self, "CACHE_MODE", "off")).strip().lower()
+        if cache_mode not in ("off", "gated"):
+            raise ValueError(f"Unsupported CACHE_MODE={self.CACHE_MODE}. Use 'off' or 'gated'.")
+        self.CACHE_MODE = cache_mode
+
+        self.ENABLE_GO_GUARDIAN = True
+        self.GATE_REQUIRE_OFFDIAG_IMPROVEMENT = True
+        if float(self.GATE_MAX_OFFDIAG_DELTA) <= 0.0:
+            self.GATE_MAX_OFFDIAG_DELTA = 0.06
+        if float(self.RHO) < 0.88:
+            self.RHO = 0.88
+        if float(self.CAPA_BASELINE_FUSION_LAMBDA) >= 1.0:
+            self.CAPA_BASELINE_FUSION_LAMBDA = float(self.CAPAV1_DUALTRACK_BLEND)
+        if float(self.TAU_PRIOR) <= 0.0:
+            self.TAU_PRIOR = 0.05
+        if bool(self.DEBUG):
+            self.CAPAV1_GUARDED_DUMP = True
+
+        save_dir = str(self.SAVE_DIR)
+        if os.path.basename(os.path.normpath(save_dir)).lower() != "capav1_gt":
+            self.SAVE_DIR = os.path.join(save_dir, "capav1_gt")
+
+        if self.PARAM_PROFILE == "professor":
+            self.KAPPA0 = float(np.clip(self.PROF_KAPPA0, 20.0, 60.0))
+            self.KAPPA_EMA = float(np.clip(self.PROF_KAPPA_EMA, 30.0, 80.0))
+            self.GATE_USE_RHO_QUANTILE = True
+            self.RHO_QUANTILE = 0.80
+            self.ENABLE_GO_GUARDIAN = True
+            self.GO_DRY_RUN = True
+            self.GO_PSI_THR = float(self.PROF_PSI_THR)
+            self.CAPA_BASELINE_FUSION_LAMBDA = min(
+                float(self.CAPA_BASELINE_FUSION_LAMBDA),
+                float(self.PROF_LAMBDA_MAX),
+            )
+            self.PROF_AUTO_SCALE = True
+            self.PROF_AUTO_TEMPERATURE = True
+            self.PROF_AUTO_THRESHOLDS = True
+            self.PROF_DYNAMIC_EPSILON = True
+            self.PROF_DYNAMIC_TAU = True
+
+class CAPA5NotebookRunner:
+    def __init__(self, config: CAPA5Config):
+        self.config = config
+        self.device = torch.device(self.config.DEVICE)
+        self.config.VERBOSE = bool(self.config.VERBOSE) or bool(getattr(self.config, "DEBUG", False))
+        self._log(f"[CAPA] Init on {self.device} (verbose={self.config.VERBOSE})")
+        self._init_seed()
+        self._init_clip_model()
+        self._init_state()
+        if not os.path.exists(self.config.SAVE_DIR):
+            os.makedirs(self.config.SAVE_DIR)
+
+    def _log(self, msg: str, *, always: bool = False):
+        if always or self.config.VERBOSE:
+            print(msg)
+    
+    def _init_seed(self):
+        random.seed(self.config.RANDOM_SEED)
+        np.random.seed(self.config.RANDOM_SEED)
+        torch.manual_seed(self.config.RANDOM_SEED)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(self.config.RANDOM_SEED)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+    def _uses_dual_track_inference(self) -> bool:
+        return True
+    
+    def _init_clip_model(self):
+        model_dir = self.config.LOCAL_MODEL_PATH
+        if not os.path.exists(model_dir): os.makedirs(model_dir)
+        os.environ["HF_HOME"] = model_dir
+        try:
+            self.clip_model, _, _ = open_clip.create_model_and_transforms(
+                self.config.MODEL_NAME, cache_dir=model_dir
+            )
+            self.tokenizer = open_clip.get_tokenizer(self.config.MODEL_NAME)
+            self.clip_model = self.clip_model.to(self.device).eval()
+            self._log(" BioMedCLIP Loaded.")
+        except Exception as e:
+            print(f" Model Load Error: {e}")
+            raise e
+
+    def _init_state(self):
+        self.zI_mean = None; self.zT_mean = None; self.W_zca = None
+        self.T_opt = self.config.INIT_TEMPERATURE
+        self.s_opt = self.config.INIT_SCALE_FACTOR
+        self.t_raw_pooled = None
+        self.t_raw_pooled_raw = None  # store unwhitened text prototypes for raw-space geometry reporting
+        self.t_align_base = None
+        self.t_paraphrases = []
+        self.current_R = None; self.image_centroids = None
+        self.support_counts = None; self.rejected_counts = None; self.prior_counts = None; self.b_c = None
+        self.is_frozen = False; self.R_frozen = None
+        self.cache_keys = None
+        self.cache_labels = None
+        self.cache_is_multi = False
+        self.cache_ready = False
+        self.cache_reference = None
+        self.cache_reference_ready = False
+        self.last_cache_eval_info = {}
+        self.final_alignment_stats = {}
+        self.max_leverage_info = "N/A"
+        self.R_last_good = None
+        self.centroids_last_good = None
+
+        # GO Guardian runtime state.
+        self.guardian_status = "off"  # off | baseline_collect | normal | frozen
+        self.guardian_last_alarm_step = -1
+        self.guardian_num_alarms = 0
+        self.guardian_resume_streak = 0
+        self.guardian_last_psi = np.nan
+        self.guardian_psi_history: List[float] = []
+        self.guardian_psi_baseline_hist: Optional[np.ndarray] = None
+        self.guardian_psi_bin_edges: Optional[np.ndarray] = None
+        self.guardian_baseline_values: List[float] = []
+        self.guardian_window_values: List[float] = []
+
+        # GO multi-label tau cache by active-label cardinality.
+        self.go_ml_tau_cache: Dict[int, float] = {}
+
+    def _l2_norm(self, x, dim=-1):
+        return F.normalize(x, p=2, dim=dim, eps=1e-8)
+
+    def _encode_text(self, texts: List[str]):
+        with torch.no_grad():
+            text_inputs = self.tokenizer(texts).to(self.device)
+            return self._l2_norm(self.clip_model.encode_text(text_inputs))
+
+    def _find_embedding_col(self, cols):
+        for c in cols:
+            if ('img' in c.lower() or 'visual' in c.lower()) and ('emb' in c.lower() or 'feat' in c.lower()): return c
+            if 'embedding' in c.lower(): return c
+        return None
+
+    def _canonical_dataset_name(self, dataset_name: Optional[str]) -> str:
+        if dataset_name is None:
+            return ""
+        raw = str(dataset_name).strip()
+        low = raw.lower()
+        if "chexpert" in low:
+            return "CheXpert"
+        if "mimic" in low:
+            return "MIMIC"
+        if "covid" in low:
+            return "COVID"
+        if "rsna" in low:
+            return "RSNA"
+        return raw
+
+    def _resolve_legacy_data_path(self, path: str) -> str:
+        p = str(path)
+        if os.path.isfile(p):
+            return p
+        if not os.path.exists(p):
+            return p
+        if os.path.isdir(p):
+            low = p.lower().replace("/", "\\")
+            data_root = str(getattr(self.config, "DATA_ROOT", "")).rstrip("\\/")
+            if "chexpert-v1.0-small" in low:
+                mapped = os.path.join(data_root, "chexpert_small_full.pkl")
+                return mapped
+            if "covid19-radiography-database" in low:
+                mapped = os.path.join(data_root, "COVID_3616x2.pkl")
+                return mapped
+            if low.endswith("\\rsna") or ("\\raw_data\\rsna" in low):
+                mapped = os.path.join(data_root, "RSNA_4243x2.pkl")
+                return mapped
+        return p
+
+    def _project_multilabels_to_runtime_label_space(
+        self,
+        y,
+        source_class_names: Optional[List[str]] = None,
+    ) -> Tuple[np.ndarray, bool]:
+        y_arr = np.asarray(y)
+        if y_arr.ndim != 2:
+            return y_arr.astype(np.int32), False
+        if y_arr.shape[1] == 1:
+            return y_arr[:, 0].astype(np.int32), False
+        target_names = list(self.config.ORDERED_CLASS_NAMES)
+        if y_arr.shape[1] == len(target_names):
+            return (y_arr > 0).astype(np.int32), True
+
+        names = None
+        if source_class_names is not None:
+            names = [str(x) for x in source_class_names]
+        elif y_arr.shape[1] == len(self.config.SOURCE_CLASS_NAMES_14):
+            names = list(self.config.SOURCE_CLASS_NAMES_14)
+
+        if names is None:
+            return (y_arr > 0).astype(np.int32), True
+
+        index_map = {name: idx for idx, name in enumerate(names)}
+        out = np.zeros((y_arr.shape[0], len(target_names)), dtype=np.int32)
+        missing = []
+        for j, cls_name in enumerate(target_names):
+            src_idx = index_map.get(cls_name, None)
+            if src_idx is None or src_idx >= y_arr.shape[1]:
+                missing.append(cls_name)
+                continue
+            out[:, j] = (y_arr[:, src_idx] > 0).astype(np.int32)
+
+        if missing:
+            self._log(
+                f"[LabelSpace] Missing labels for active space={self.config.LABEL_SPACE}: {missing}. They will stay zero.",
+                always=True,
+            )
+        return out, True
+
+    def _get_source_class_names_override(
+        self,
+        src: str,
+        y,
+    ) -> Optional[List[str]]:
+        y_arr = np.asarray(y)
+        if y_arr.ndim != 2 or int(y_arr.shape[1]) != len(FULL_14_CLASS_NAMES):
+            return None
+        profile = str(getattr(self.config, "SOURCE_LABEL_ORDER_PROFILE", "default"))
+        if profile != "chexpert5_reordered_200x5":
+            return None
+        base = os.path.basename(str(src)).lower()
+        if base in {"mimic_forchexpert-5_200x5.pkl", "mimic_200x5.pkl", "chexpert_200x5.pkl"}:
+            self._log(
+                f"[LabelOrder] Applying assumed CheXpert-5 reordered source order to {base}.",
+                always=True,
+            )
+            return list(CHEXPERT5_REORDERED_SOURCE_ORDER_14)
+        return None
+
+    def _load_data(self, path, is_calibration=False, split_override: Optional[int] = None):
+        src = self._resolve_legacy_data_path(path)
+        if not os.path.exists(src):
+            raise FileNotFoundError(f"Missing: {path} (resolved={src})")
+        data = None
+        try:
+            with open(src, "rb") as f:
+                data = pickle.load(f)
+        except Exception:
+            # Support torch.save payloads (e.g., chexpert_small_full.pkl built by build_train_pkl.py).
+            data = torch.load(src, map_location="cpu", weights_only=False)
+
+        # Support dict payload generated by build_train_pkl.py (embeddings/labels/split/class_names)
+        if isinstance(data, dict) and ("embeddings" in data):
+            emb = np.asarray(data.get("embeddings", []), dtype=np.float32)
+            if emb.ndim != 2:
+                raise RuntimeError(f"Invalid embeddings shape in {src}: {emb.shape}")
+            y = np.asarray(data.get("labels", [])) if ("labels" in data) else None
+            source_class_names = data.get("class_names", None)
+            split = np.asarray(data.get("split", []), dtype=np.int8).reshape(-1) if ("split" in data) else None
+
+            mask = np.ones(emb.shape[0], dtype=bool)
+            if split is not None and split.shape[0] == emb.shape[0]:
+                use_split = None
+                if split_override is not None:
+                    use_split = int(split_override)
+                elif src == self.config.TRAIN_DATA_PATH:
+                    use_split = 0
+                elif is_calibration or src in (self.config.CALIB_DATA_PATH, self.config.TAU_CALIB_DATA_PATH):
+                    use_split = 1
+                elif src in [self._resolve_legacy_data_path(v) for v in list(self.config.TEST_DATA_PATHS.values())]:
+                    use_split = 2
+                if use_split is not None:
+                    mask = split == int(use_split)
+                    if int(mask.sum()) == 0:
+                        # Fallback: keep all if requested split does not exist.
+                        mask = np.ones(emb.shape[0], dtype=bool)
+
+            emb = emb[mask]
+            z = torch.tensor(emb, dtype=torch.float32)
+            if y is not None and y.size > 0:
+                y = y[mask]
+                if source_class_names is None:
+                    source_class_names = self._get_source_class_names_override(src, y)
+                y, is_multi = self._project_multilabels_to_runtime_label_space(y, source_class_names=source_class_names)
+                return z.to(self.device), y.astype(np.int32), is_multi
+            return z.to(self.device), None, False
+
+        col = self._find_embedding_col(data.columns)
+        if col is None:
+            raise RuntimeError(f"Cannot find embedding column in {src}. Columns: {list(data.columns)}")
+        vals = data[col].values
+        z = torch.stack(list(vals)) if isinstance(vals[0], torch.Tensor) else torch.tensor(np.stack(list(vals)), dtype=torch.float32)
+        if is_calibration and "chexpert_mimic" in src.lower():
+            z = z[:1000]
+        
+        y, is_multi = None, False
+        lower_cols = {c.lower(): c for c in data.columns}
+        cand_cols = ['labels', 'label', 'finding', 'target', 'class', 'studylabel', 'pneumonia', 'covid']
+        found_col = next((lower_cols[c] for c in cand_cols if c in lower_cols), None)
+        
+        if found_col:
+            raw = data[found_col].values
+            if isinstance(raw[0], (list, tuple, np.ndarray)):
+                if len(raw[0]) > 1: 
+                    y = np.stack(raw)  # 鐩存帴 stack 鎴?(N, C) 鐨?2D 鏁扮粍
+                    source_class_names = self._get_source_class_names_override(src, y)
+                    y, is_multi = self._project_multilabels_to_runtime_label_space(
+                        y,
+                        source_class_names=source_class_names,
+                    )
+                else: 
+                    y = np.array([int(x[0]) if len(x)>0 else 0 for x in raw])
+            else: 
+                y = np.array([int(x) for x in raw])
+
+        if y is not None and len(y) != len(z):
+            n_trim = min(int(len(z)), int(len(y)))
+            z = z[:n_trim]
+            y = y[:n_trim]
+        return z.to(self.device), y, is_multi
+            
+    def _apply_preprocessing(self, z, mean_vec):
+        if mean_vec is None: return self._l2_norm(z)
+        z_centered = z - mean_vec
+        if self.config.USE_ZCA_WHITEN and self.W_zca is not None:
+            z_centered = torch.matmul(z_centered, self.W_zca)
+        return self._l2_norm(z_centered)
+
+    def _get_alignment_text_base(self) -> torch.Tensor:
+        if (
+            self.t_align_base is not None
+            and self.t_raw_pooled is not None
+            and isinstance(self.t_align_base, torch.Tensor)
+            and tuple(self.t_align_base.shape) == tuple(self.t_raw_pooled.shape)
+        ):
+            return self.t_align_base
+        return self.t_raw_pooled
+
+    def _build_prototypes(self):
+        classes = self.config.ORDERED_CLASS_NAMES
+        t_reshaped_list = []
+        for cls_name in classes:
+            syns = self.config.MEDICAL_SYNONYM_MAP.get(cls_name, [cls_name])
+            templates = self.config.TEMPLATES_PI
+            cls_texts = [templates[i % len(templates)].replace("{finding}", syns[i % len(syns)]) for i in range(self.config.M)]
+            t_reshaped_list.append(self._encode_text(cls_texts))
+        t_reshaped = torch.stack(t_reshaped_list)  # shape [C, M, D]
+
+        # 1) Raw pooled prototypes (raw space) 鈥?store for geometry reporting
+        self.t_raw_pooled_raw = self._l2_norm(t_reshaped.mean(dim=1))  # [C, D]
+
+        # 2) Compute text-mean on raw pooled (this will serve as zT_mean)
+        self.zT_mean = self.t_raw_pooled_raw.mean(dim=0, keepdim=True)
+
+        # 3) Now generate processed/whitened prototypes for scoring
+        t_all_flat = t_reshaped.view(-1, t_reshaped.shape[-1])
+        t_all_flat_proc = self._apply_preprocessing(t_all_flat, self.zT_mean)
+        t_reshaped_proc = t_all_flat_proc.view(len(classes), self.config.M, -1)
+        self.t_raw_pooled = self._l2_norm(t_reshaped_proc.mean(dim=1))
+        self.t_align_base = self.t_raw_pooled.clone()
+        self.cache_keys = None
+        self.cache_labels = None
+        self.cache_is_multi = False
+        self.cache_ready = False
+        self.cache_reference = None
+        self.cache_reference_ready = False
+        self.last_cache_eval_info = {}
+        self.t_paraphrases = [self._l2_norm(t_reshaped_proc[:, m, :]) for m in range(self.config.M)]
+
+    def _set_prior_bias_from_counts(self, counts: torch.Tensor):
+        tau_prior = float(getattr(self.config, "TAU_PRIOR", 0.0))
+        if tau_prior <= 0.0:
+            self.b_c = torch.zeros((1, self.t_raw_pooled.shape[0]), device=self.device)
+            return
+        cnt = counts.detach().to(self.device).float()
+        priors = (cnt + 1.0) / (cnt.sum() + float(len(cnt)))
+        self.b_c = (tau_prior * torch.log(priors.clamp_min(1e-8))).view(1, -1)
+
+    def _is_professor_profile(self) -> bool:
+        return str(getattr(self.config, "PARAM_PROFILE", "default")) == "professor"
+
+    def _get_alignment_active_mask(self, n_cls: Optional[int] = None) -> torch.Tensor:
+        if self.support_counts is None:
+            size = len(self.config.ORDERED_CLASS_NAMES) if n_cls is None else int(n_cls)
+            return torch.ones(size, dtype=torch.bool, device=self.device)
+        base = (self.support_counts >= self.config.N_MIN_SUPPORT_FOR_ACTIVE).to(self.device)
+        if n_cls is not None:
+            base = base[: int(n_cls)]
+        return base
+
+    def _snapshot_last_good_state(self) -> None:
+        if isinstance(self.current_R, torch.Tensor):
+            self.R_last_good = self.current_R.detach().clone()
+        if isinstance(self.image_centroids, torch.Tensor):
+            self.centroids_last_good = self.image_centroids.detach().clone()
+
+    def _professor_target_entropy(self, n_cls: int) -> float:
+        n_cls = max(1, int(n_cls))
+        if n_cls <= 1:
+            return 0.0
+        p1 = float(np.clip(getattr(self.config, "PROF_TARGET_TOP1", 0.75), 1e-4, 1.0 - 1e-4))
+        p_rest = (1.0 - p1) / max(1, (n_cls - 1))
+        return float(-(p1 * np.log(p1) + (n_cls - 1) * p_rest * np.log(max(p_rest, 1e-8))))
+
+    def _estimate_scale_for_target_top1(self, z_ref: torch.Tensor, t_ref: torch.Tensor) -> float:
+        if z_ref.numel() == 0:
+            return float(self.s_opt)
+        logits_base = torch.matmul(z_ref, t_ref.T) + self.b_c
+        target = float(np.clip(getattr(self.config, "PROF_TARGET_TOP1", 0.75), 0.5, 0.99))
+        candidates = np.geomspace(0.25, 20.0, num=31)
+        best_s = float(self.s_opt)
+        best_gap = float("inf")
+        with torch.no_grad():
+            for s_val in candidates:
+                probs = F.softmax(logits_base * float(s_val), dim=1)
+                top1_med = float(torch.median(probs.max(dim=1).values).item())
+                gap = abs(top1_med - target)
+                if gap < best_gap:
+                    best_gap = gap
+                    best_s = float(s_val)
+        return best_s
+
+    def _estimate_temperature_for_target_entropy(self, logits_ref: torch.Tensor) -> float:
+        if logits_ref.numel() == 0:
+            return float(self.T_opt)
+        target_h = self._professor_target_entropy(int(logits_ref.shape[1]))
+        candidates = np.geomspace(0.25, 4.0, num=31)
+        best_t = float(self.T_opt)
+        best_gap = float("inf")
+        with torch.no_grad():
+            for t_val in candidates:
+                probs = F.softmax(logits_ref / float(t_val), dim=1)
+                ent = -(probs * torch.log(probs.clamp_min(1e-8))).sum(dim=1).mean().item()
+                gap = abs(float(ent) - target_h)
+                if gap < best_gap:
+                    best_gap = gap
+                    best_t = float(t_val)
+        return best_t
+
+    def _apply_param_profile_from_calibration(self, z_cal_proc: torch.Tensor):
+        if not self._is_professor_profile():
+            return
+        if z_cal_proc is None or z_cal_proc.numel() == 0:
+            return
+
+        n_ref = min(int(len(z_cal_proc)), 2048)
+        z_ref = z_cal_proc[:n_ref]
+        t_ref = self._get_alignment_text_base()
+
+        if bool(getattr(self.config, "PROF_AUTO_SCALE", False)):
+            self.s_opt = self._estimate_scale_for_target_top1(z_ref, t_ref)
+        logits_ref = self.s_opt * torch.matmul(z_ref, t_ref.T) + self.b_c
+        if bool(getattr(self.config, "PROF_AUTO_TEMPERATURE", False)):
+            self.T_opt = self._estimate_temperature_for_target_entropy(logits_ref)
+        self.config.INIT_SCALE_FACTOR = float(self.s_opt)
+        self.config.INIT_TEMPERATURE = float(self.T_opt)
+
+        self._log(
+            (
+                f"[Profile:Professor] s={self.s_opt:.4f}, T={self.T_opt:.4f}, "
+                f"rho_q={self.config.RHO_QUANTILE:.2f}, "
+                f"eps_pct={float(getattr(self.config, 'PROF_EPSILON_GAP_PCT', 0.015)):.3f}, "
+                f"psi_thr={float(self.config.GO_PSI_THR):.3f}, lambda={float(self.config.CAPA_BASELINE_FUSION_LAMBDA):.3f}"
+            ),
+            always=True,
+        )
+
+    def _is_go_guardian_enabled(self) -> bool:
+        return bool(getattr(self.config, "ENABLE_GO_GUARDIAN", False))
+
+    def _guardian_is_frozen(self) -> bool:
+        return str(self.guardian_status) == "frozen"
+
+    def _guardian_hist_from_values(self, values: np.ndarray, bins: np.ndarray) -> np.ndarray:
+        hist, _ = np.histogram(values, bins=bins)
+        dist = hist.astype(np.float64)
+        eps = 1e-6
+        dist = (dist + eps) / (dist.sum() + eps * len(dist))
+        return dist
+
+    def _compute_psi_from_dists(self, expected_dist: np.ndarray, actual_dist: np.ndarray) -> float:
+        e = np.asarray(expected_dist, dtype=np.float64)
+        a = np.asarray(actual_dist, dtype=np.float64)
+        eps = 1e-6
+        return float(np.sum((a - e) * np.log((a + eps) / (e + eps))))
+
+    def _guardian_init_baseline(self):
+        if not self._is_go_guardian_enabled():
+            return
+        vals = np.asarray(self.guardian_baseline_values, dtype=np.float64)
+        vals = np.clip(vals, 0.0, 1.0)
+        n_bins = max(5, int(getattr(self.config, "GO_PSI_BINS", 10)))
+        if vals.size < n_bins:
+            return
+        bins = np.linspace(0.0, 1.0, n_bins + 1, dtype=np.float64)
+        baseline_hist = self._guardian_hist_from_values(vals, bins)
+
+        self.guardian_psi_bin_edges = bins
+        self.guardian_psi_baseline_hist = baseline_hist
+        self.guardian_last_psi = np.nan
+        self.guardian_psi_history = []
+        self.guardian_resume_streak = 0
+        self.guardian_num_alarms = 0
+        self.guardian_last_alarm_step = -1
+        self.guardian_window_values = []
+        self._log(
+            f"[GO] Baseline ready: n={int(vals.size)}, bins={n_bins}, "
+            f"psi_thr={float(self.config.GO_PSI_THR):.3f}, resume={float(self.config.GO_TAU_RESUME):.3f}x{int(self.config.GO_RESUME_WINDOWS)}",
+            always=True,
+        )
+
+    def _guardian_collect_batch_scalars(self, probs: torch.Tensor):
+        if (not self._is_go_guardian_enabled()) or probs is None:
+            return
+        scalar_name = str(getattr(self.config, "GO_GUARDIAN_SCALAR", "top1_conf")).strip().lower()
+        if scalar_name == "top1_conf":
+            vals = probs.max(dim=1).values.detach().cpu().numpy()
+        else:
+            vals = probs.max(dim=1).values.detach().cpu().numpy()
+        vals = np.clip(np.asarray(vals, dtype=np.float64), 0.0, 1.0)
+        if vals.size <= 0:
+            return
+        max_base = max(128, int(getattr(self.config, "GO_PSI_BASELINE_MAX", 5000)))
+        if str(self.guardian_status) == "baseline_collect":
+            self.guardian_baseline_values.extend([float(v) for v in vals.tolist()])
+            if len(self.guardian_baseline_values) > max_base:
+                self.guardian_baseline_values = self.guardian_baseline_values[-max_base:]
+        else:
+            self.guardian_window_values.extend([float(v) for v in vals.tolist()])
+
+    def _guardian_window_psi(self) -> Optional[float]:
+        if self.guardian_psi_baseline_hist is None or self.guardian_psi_bin_edges is None:
+            return None
+        win = max(16, int(getattr(self.config, "GO_PSI_WINDOW", 512)))
+        if len(self.guardian_window_values) < win:
+            return None
+        curr = np.asarray(self.guardian_window_values[:win], dtype=np.float64)
+        self.guardian_window_values = self.guardian_window_values[win:]
+        curr_hist = self._guardian_hist_from_values(curr, self.guardian_psi_bin_edges)
+        return self._compute_psi_from_dists(self.guardian_psi_baseline_hist, curr_hist)
+
+    def _guardian_update_from_window(self, step: int, probs: torch.Tensor) -> Optional[Dict[str, object]]:
+        if not self._is_go_guardian_enabled():
+            return None
+        warm = max(0, int(getattr(self.config, "GO_WARMUP_STEPS", 50)))
+        collect = max(0, int(getattr(self.config, "GO_BASELINE_COLLECT_STEPS", 50)))
+        end_collect = warm + collect
+        prev_status = str(self.guardian_status)
+
+        if int(step) < warm:
+            self.guardian_status = "off"
+            return None
+
+        if int(step) < end_collect:
+            if prev_status != "baseline_collect":
+                self.guardian_baseline_values = []
+                self.guardian_window_values = []
+                self.guardian_psi_baseline_hist = None
+                self.guardian_psi_bin_edges = None
+            self.guardian_status = "baseline_collect"
+            self._guardian_collect_batch_scalars(probs)
+            if int(step) == end_collect - 1:
+                self._guardian_init_baseline()
+                if self.guardian_psi_baseline_hist is not None:
+                    self.guardian_status = "normal"
+                    self._snapshot_last_good_state()
+            return {"step": int(step), "status": str(self.guardian_status), "phase": "baseline_collect"}
+
+        if self.guardian_psi_baseline_hist is None or self.guardian_psi_bin_edges is None:
+            self.guardian_status = "baseline_collect"
+            self._guardian_collect_batch_scalars(probs)
+            self._guardian_init_baseline()
+            return {"step": int(step), "status": str(self.guardian_status), "phase": "baseline_collect_fallback"}
+
+        if str(self.guardian_status) not in ("normal", "frozen"):
+            self.guardian_status = "normal"
+            self.guardian_resume_streak = 0
+            self._snapshot_last_good_state()
+
+        self._guardian_collect_batch_scalars(probs)
+        psi = self._guardian_window_psi()
+        if psi is None:
+            return None
+
+        psi = float(psi)
+        self.guardian_last_psi = psi
+        self.guardian_psi_history.append(psi)
+        changed = False
+        dry_run = bool(getattr(self.config, "GO_DRY_RUN", False))
+        psi_thr = float(getattr(self.config, "GO_PSI_THR", 2.0))
+        tau_resume = float(getattr(self.config, "GO_TAU_RESUME", 1.0))
+        resume_windows = max(1, int(getattr(self.config, "GO_RESUME_WINDOWS", 3)))
+
+        if self.guardian_status == "normal":
+            if psi > psi_thr:
+                self.guardian_last_alarm_step = int(step)
+                self.guardian_num_alarms += 1
+                self.guardian_resume_streak = 0
+                if not dry_run:
+                    self.guardian_status = "frozen"
+                    changed = True
+        elif self.guardian_status == "frozen":
+            if psi < tau_resume:
+                self.guardian_resume_streak += 1
+                if self.guardian_resume_streak >= resume_windows:
+                    self.guardian_status = "normal"
+                    self.guardian_resume_streak = 0
+                    changed = True
+            else:
+                self.guardian_resume_streak = 0
+                if psi > psi_thr:
+                    self.guardian_last_alarm_step = int(step)
+                    self.guardian_num_alarms += 1
+
+        if self._guardian_is_frozen() and isinstance(self.R_last_good, torch.Tensor):
+            self.current_R = self.R_last_good.clone()
+            self.R_frozen = self.R_last_good.clone()
+            if isinstance(self.centroids_last_good, torch.Tensor):
+                self.image_centroids = self.centroids_last_good.clone()
+
+        return {
+            "step": int(step),
+            "psi": psi,
+            "status": str(self.guardian_status),
+            "changed": bool(changed),
+            "frozen": bool(self._guardian_is_frozen()),
+            "dry_run": bool(dry_run),
+        }
+
+    def _resolve_scoring_mode(self, scoring_mode: Optional[str] = None) -> str:
+        mode = str(scoring_mode or getattr(self.config, "SCORING_MODE", "mixed")).strip().lower()
+        if mode not in ("mixed", "softmax"):
+            raise ValueError(f"Unsupported scoring mode: {mode}. Use 'mixed' or 'softmax'.")
+        return mode
+
+    def _resolve_sim_source(self, sim_source: Optional[str] = None) -> str:
+        src = str(sim_source or getattr(self.config, "SIM_SOURCE", "gate")).strip().lower()
+        if src not in ("gate", "dataset"):
+            raise ValueError(f"Unsupported sim source: {src}. Use 'gate' or 'dataset'.")
+        return src
+
+    def _get_binary_positive_indices(self, dataset_name: Optional[str], n_proto: int) -> List[int]:
+        key = dataset_name if dataset_name in self.config.BINARY_POSITIVE_CLASS_MAP else "default"
+        class_names = self.config.BINARY_POSITIVE_CLASS_MAP.get(key, [])
+        if not class_names:
+            class_names = self.config.BINARY_POSITIVE_CLASS_MAP.get("default", ["Pneumonia"])
+        idxs: List[int] = []
+        for cls in class_names:
+            if cls in self.config.ORDERED_CLASS_NAMES:
+                idx = self.config.ORDERED_CLASS_NAMES.index(cls)
+                if idx < n_proto:
+                    idxs.append(idx)
+        if not idxs and n_proto > 0:
+            fallback = 0
+            if "Pneumonia" in self.config.ORDERED_CLASS_NAMES:
+                fallback = min(self.config.ORDERED_CLASS_NAMES.index("Pneumonia"), n_proto - 1)
+            idxs = [fallback]
+        return sorted(set(idxs))
+
+    def _binary_logit_from_multiclass(self, logits: torch.Tensor, pos_indices: List[int]) -> torch.Tensor:
+        n_cls = logits.shape[1]
+        pos_mask = torch.zeros(n_cls, dtype=torch.bool, device=logits.device)
+        pos_mask[pos_indices] = True
+        neg_mask = ~pos_mask
+        if not neg_mask.any():
+            return logits[:, pos_indices].mean(dim=1)
+        pos_term = torch.logsumexp(logits[:, pos_mask], dim=1)
+        neg_term = torch.logsumexp(logits[:, neg_mask], dim=1)
+        return pos_term - neg_term
+
+    def _is_cache_enabled(self) -> bool:
+        return str(getattr(self.config, "CACHE_MODE", "off")).strip().lower() == "gated"
+
+    def _default_cache_eval_info(self) -> Dict[str, float]:
+        return {
+            "mode": str(getattr(self.config, "CACHE_MODE", "off")).strip().lower(),
+            "dataset_gate": False,
+            "psi_top1": np.nan,
+            "psi_topk_mean": np.nan,
+            "psi_entropy": np.nan,
+            "usage_rate": 0.0,
+            "mean_alpha": 0.0,
+            "agree_rate": np.nan,
+            "mean_top1_sim": np.nan,
+            "mean_purity": np.nan,
+            "mean_entropy": np.nan,
+            "tau_sim": np.nan,
+            "tau_purity": np.nan,
+            "tau_entropy": np.nan,
+        }
+
+    def _labels_to_cache_matrix(
+        self,
+        y_labels,
+        *,
+        is_multi: bool,
+        dataset_name: Optional[str],
+        n_cls: int,
+    ) -> Optional[torch.Tensor]:
+        if y_labels is None:
+            return None
+        y_arr = np.asarray(y_labels)
+        if y_arr.ndim == 0:
+            return None
+        n = int(y_arr.shape[0])
+        if n <= 0:
+            return None
+        out = np.zeros((n, n_cls), dtype=np.float32)
+        if is_multi:
+            if y_arr.ndim == 1:
+                y_arr = y_arr.reshape(-1, 1)
+            n_use = max(1, min(n_cls, int(y_arr.shape[1])))
+            out[:, :n_use] = (y_arr[:, :n_use] > 0).astype(np.float32)
+        else:
+            y_bin = (y_arr.reshape(-1) > 0).astype(np.float32)
+            pos_indices = self._get_binary_positive_indices(dataset_name, n_cls)
+            for idx in pos_indices:
+                out[:, idx] = y_bin
+        return torch.tensor(out, dtype=torch.float32)
+
+    def _build_global_cache(self) -> bool:
+        if self.cache_ready and self.cache_keys is not None and self.cache_labels is not None:
+            return True
+        if not self._is_cache_enabled():
+            return False
+        try:
+            z_raw, y_train, is_multi = self._load_data(
+                self.config.TRAIN_DATA_PATH,
+                split_override=0,
+            )
+        except Exception as e:
+            self._log(f"[Cache] build skipped (load error): {e}")
+            return False
+        if y_train is None or len(z_raw) == 0:
+            return False
+        z_proc = self._apply_preprocessing(z_raw, self.zI_mean).detach().cpu()
+        y_cache = self._labels_to_cache_matrix(
+            y_train,
+            is_multi=is_multi,
+            dataset_name="default",
+            n_cls=int(self.t_raw_pooled.shape[0]),
+        )
+        if y_cache is None:
+            return False
+        y_cache = y_cache.detach().cpu()
+        if z_proc.shape[0] != y_cache.shape[0]:
+            n = min(int(z_proc.shape[0]), int(y_cache.shape[0]))
+            z_proc = z_proc[:n]
+            y_cache = y_cache[:n]
+        if int(z_proc.shape[0]) <= 0:
+            return False
+        self.cache_keys = z_proc
+        self.cache_labels = y_cache
+        self.cache_is_multi = bool(is_multi)
+        self.cache_ready = True
+        self._log(
+            f"[Cache] built keys={int(z_proc.shape[0])}, dim={int(z_proc.shape[1])}, n_cls={int(y_cache.shape[1])}",
+            always=True,
+        )
+        return True
+
+    def _compute_cache_payload(self, z_embed: torch.Tensor) -> Optional[Dict[str, torch.Tensor]]:
+        if not self._build_global_cache():
+            return None
+        keys = self.cache_keys
+        labels = self.cache_labels
+        if keys is None or labels is None:
+            return None
+        if keys.numel() == 0 or labels.numel() == 0:
+            return None
+
+        cache_topk = max(1, min(int(getattr(self.config, "CACHE_TOPK", 16)), int(keys.shape[0])))
+        cache_temp = max(float(getattr(self.config, "CACHE_TEMP", 0.08)), 1e-4)
+        chunk_size = max(16, int(getattr(self.config, "CACHE_CHUNK", 512)))
+        self_match_cos = float(getattr(self.config, "CACHE_SELF_MATCH_COS", 0.999999))
+
+        z_cpu = z_embed.detach().float().cpu()
+        logits_chunks: List[torch.Tensor] = []
+        top1_chunks: List[torch.Tensor] = []
+        topk_mean_chunks: List[torch.Tensor] = []
+        q_chunks: List[torch.Tensor] = []
+        purity_chunks: List[torch.Tensor] = []
+        entropy_chunks: List[torch.Tensor] = []
+        top1_idx_chunks: List[torch.Tensor] = []
+
+        for s in range(0, int(z_cpu.shape[0]), chunk_size):
+            e = min(s + chunk_size, int(z_cpu.shape[0]))
+            z_part = z_cpu[s:e]
+            sims = torch.matmul(z_part, keys.T)
+            self_mask = sims >= self_match_cos
+            if bool(self_mask.any().item()):
+                sims = sims.masked_fill(self_mask, -1e9)
+            topv, topi = torch.topk(sims, k=cache_topk, dim=1, largest=True, sorted=False)
+            w = F.softmax(topv / cache_temp, dim=1)
+            neigh = labels[topi]
+            p_ind = (w.unsqueeze(-1) * neigh).sum(dim=1).clamp(1e-4, 1.0 - 1e-4)
+            q_mass = p_ind.clamp_min(1e-8)
+            q_norm = q_mass / q_mass.sum(dim=1, keepdim=True).clamp_min(1e-8)
+            entropy = -(q_norm * torch.log(q_norm.clamp_min(1e-8))).sum(dim=1)
+            purity, cache_top1 = q_norm.max(dim=1)
+            logits_chunks.append(torch.log(p_ind / (1.0 - p_ind)))
+            top1_chunks.append(topv.max(dim=1).values)
+            topk_mean_chunks.append(topv.mean(dim=1))
+            q_chunks.append(q_norm)
+            purity_chunks.append(purity)
+            entropy_chunks.append(entropy)
+            top1_idx_chunks.append(cache_top1)
+
+        return {
+            "cache_logits": torch.cat(logits_chunks, dim=0).to(z_embed.device),
+            "top1_sim": torch.cat(top1_chunks, dim=0).to(z_embed.device),
+            "topk_mean_sim": torch.cat(topk_mean_chunks, dim=0).to(z_embed.device),
+            "q_cache": torch.cat(q_chunks, dim=0).to(z_embed.device),
+            "purity": torch.cat(purity_chunks, dim=0).to(z_embed.device),
+            "entropy": torch.cat(entropy_chunks, dim=0).to(z_embed.device),
+            "cache_top1": torch.cat(top1_idx_chunks, dim=0).to(z_embed.device),
+        }
+
+    def _ensure_cache_reference_stats(self) -> bool:
+        if self.cache_reference_ready and isinstance(self.cache_reference, dict):
+            return True
+        if not self._is_cache_enabled():
+            return False
+        try:
+            z_ref_raw, _, _ = self._load_data(
+                self.config.CALIB_DATA_PATH,
+                is_calibration=True,
+                split_override=1,
+            )
+            z_ref = self._apply_preprocessing(z_ref_raw, self.zI_mean)
+            payload = self._compute_cache_payload(z_ref)
+        except Exception as e:
+            self._log(f"[Cache] reference build skipped: {e}", always=True)
+            return False
+        if payload is None:
+            return False
+
+        top1 = payload["top1_sim"].detach().cpu().numpy()
+        topk_mean = payload["topk_mean_sim"].detach().cpu().numpy()
+        purity = payload["purity"].detach().cpu().numpy()
+        entropy = payload["entropy"].detach().cpu().numpy()
+        self.cache_reference = {
+            "top1_sim": top1,
+            "topk_mean_sim": topk_mean,
+            "purity": purity,
+            "entropy": entropy,
+            "tau_sim": float(np.quantile(top1, float(getattr(self.config, "CACHE_MIN_SIM_Q", 0.25)))),
+            "tau_purity": float(np.quantile(purity, float(getattr(self.config, "CACHE_MIN_PURITY_Q", 0.50)))),
+            "tau_entropy": float(np.quantile(entropy, float(getattr(self.config, "CACHE_MAX_ENTROPY_Q", 0.75)))),
+        }
+        self.cache_reference_ready = True
+        return True
+
+    def _blend_with_cache_logits(
+        self,
+        logits: torch.Tensor,
+        z_embed: torch.Tensor,
+        dataset_name: Optional[str],
+        *,
+        use_cache: bool,
+        calib_T: Optional[float] = None,
+        scoring_mode: Optional[str] = None,
+    ) -> torch.Tensor:
+        self.last_cache_eval_info = self._default_cache_eval_info()
+        if not use_cache:
+            return logits
+        if not self._is_cache_enabled():
+            return logits
+        if not self._ensure_cache_reference_stats():
+            return logits
+
+        payload = self._compute_cache_payload(z_embed)
+        if payload is None:
+            return logits
+
+        ref = self.cache_reference or {}
+        top1_np = payload["top1_sim"].detach().cpu().numpy()
+        topk_np = payload["topk_mean_sim"].detach().cpu().numpy()
+        entropy_np = payload["entropy"].detach().cpu().numpy()
+        psi_top1 = float(self._compute_psi(ref["top1_sim"], top1_np))
+        psi_topk = float(self._compute_psi(ref["topk_mean_sim"], topk_np))
+        psi_entropy = float(self._compute_psi(ref["entropy"], entropy_np))
+        psi_thr = float(getattr(self.config, "CACHE_DATASET_PSI_THR", 0.25))
+        dataset_gate = (psi_top1 <= psi_thr) and (psi_topk <= psi_thr) and (psi_entropy <= psi_thr)
+
+        tau_sim = float(ref.get("tau_sim", np.nan))
+        tau_purity = float(ref.get("tau_purity", np.nan))
+        tau_entropy = float(ref.get("tau_entropy", np.nan))
+        actual_agree = payload["cache_top1"] == logits.argmax(dim=1)
+
+        if not dataset_gate:
+            self.last_cache_eval_info = {
+                **self._default_cache_eval_info(),
+                "mode": "gated",
+                "dataset_gate": False,
+                "psi_top1": psi_top1,
+                "psi_topk_mean": psi_topk,
+                "psi_entropy": psi_entropy,
+                "agree_rate": float(actual_agree.float().mean().item()),
+                "mean_top1_sim": float(payload["top1_sim"].mean().item()),
+                "mean_purity": float(payload["purity"].mean().item()),
+                "mean_entropy": float(payload["entropy"].mean().item()),
+                "tau_sim": tau_sim,
+                "tau_purity": tau_purity,
+                "tau_entropy": tau_entropy,
+            }
+            return logits
+
+        mode = self._resolve_scoring_mode(scoring_mode)
+        t_val = max(float(self.T_opt if calib_T is None else calib_T), 1e-4)
+        if mode == "softmax":
+            base_probs_full = F.softmax(logits / t_val, dim=1)
+        else:
+            base_probs_full = torch.sigmoid(logits / t_val)
+        base_top1 = base_probs_full.argmax(dim=1)
+        max_p_base = base_probs_full.max(dim=1).values
+
+        agree_mask = (payload["cache_top1"] == base_top1).float()
+        if bool(getattr(self.config, "CACHE_REQUIRE_AGREE", True)):
+            agree_gate = agree_mask
+        else:
+            agree_gate = torch.ones_like(agree_mask)
+        sim_gate = (payload["top1_sim"] >= tau_sim).float()
+        purity_gate = (payload["purity"] >= tau_purity).float()
+        entropy_ok = (payload["entropy"] <= tau_entropy).float()
+        log_c = max(float(np.log(max(2, int(payload["cache_logits"].shape[1])))), 1e-6)
+        entropy_term = torch.clamp(1.0 - (payload["entropy"] / log_c), min=0.0, max=1.0)
+        uncertainty_term = torch.clamp(1.0 - max_p_base, min=0.0, max=1.0)
+        alpha = (
+            float(getattr(self.config, "CACHE_ALPHA_MAX", 0.10))
+            * agree_gate
+            * sim_gate
+            * purity_gate
+            * entropy_ok
+            * entropy_term
+            * uncertainty_term
+        ).clamp(min=0.0, max=float(getattr(self.config, "CACHE_ALPHA_MAX", 0.10)))
+
+        cache_logits = payload["cache_logits"]
+        n_use = min(int(logits.shape[1]), int(cache_logits.shape[1]))
+        if n_use <= 0:
+            return logits
+        out = logits.clone()
+        out[:, :n_use] = (
+            (1.0 - alpha).unsqueeze(1) * out[:, :n_use]
+            + alpha.unsqueeze(1) * cache_logits[:, :n_use]
+        )
+        self.last_cache_eval_info = {
+            "mode": "gated",
+            "dataset_gate": True,
+            "psi_top1": psi_top1,
+            "psi_topk_mean": psi_topk,
+            "psi_entropy": psi_entropy,
+            "usage_rate": float((alpha > 0).float().mean().item()),
+            "mean_alpha": float(alpha.mean().item()),
+            "agree_rate": float(agree_mask.mean().item()),
+            "mean_top1_sim": float(payload["top1_sim"].mean().item()),
+            "mean_purity": float(payload["purity"].mean().item()),
+            "mean_entropy": float(payload["entropy"].mean().item()),
+            "tau_sim": tau_sim,
+            "tau_purity": tau_purity,
+            "tau_entropy": tau_entropy,
+        }
+        return out
+
+    def _is_soft_fusion_enabled(self) -> bool:
+        if not bool(getattr(self.config, "ENABLE_CAPA_BASELINE_SOFT_FUSION", False)):
+            return False
+        lam = float(getattr(self.config, "CAPA_BASELINE_FUSION_LAMBDA", 1.0))
+        return 0.0 <= lam < 1.0
+
+    def _fuse_with_baseline_logits(
+        self,
+        logits_capa: torch.Tensor,
+        z_embed: torch.Tensor,
+        *,
+        scale: float,
+        baseline_t_protos: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if baseline_t_protos is None:
+            return logits_capa
+        if not self._is_soft_fusion_enabled():
+            return logits_capa
+        lam = min(1.0, max(0.0, float(getattr(self.config, "CAPA_BASELINE_FUSION_LAMBDA", 1.0))))
+        logits_base = scale * torch.matmul(z_embed, baseline_t_protos.T) + self.b_c
+        n_use = min(int(logits_capa.shape[1]), int(logits_base.shape[1]))
+        if n_use <= 0:
+            return logits_capa
+        out = logits_capa.clone()
+        out[:, :n_use] = lam * out[:, :n_use] + (1.0 - lam) * logits_base[:, :n_use]
+        return out
+
+    def _dual_track_confidence(self, logits: torch.Tensor) -> torch.Tensor:
+        t_val = max(float(getattr(self, "T_opt", 1.0)), 1e-4)
+        mode = self._resolve_scoring_mode(None)
+        if mode == "softmax":
+            return F.softmax(logits / t_val, dim=1).max(dim=1).values
+        return torch.sigmoid(logits / t_val).max(dim=1).values
+
+    def _select_dual_track_logits(
+        self,
+        logits_aligned: torch.Tensor,
+        z_embed: torch.Tensor,
+        *,
+        scale: float,
+        baseline_t_protos: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if baseline_t_protos is None:
+            return logits_aligned
+        logits_raw = scale * torch.matmul(z_embed, baseline_t_protos.T) + self.b_c
+        n_use = min(int(logits_aligned.shape[1]), int(logits_raw.shape[1]))
+        if n_use <= 0:
+            return logits_aligned
+        conf_aligned = self._dual_track_confidence(logits_aligned[:, :n_use])
+        conf_raw = self._dual_track_confidence(logits_raw[:, :n_use])
+        conf_margin = max(0.0, float(getattr(self.config, "CAPAV1_DUALTRACK_CONF_MARGIN", 0.0)))
+        choose_aligned = conf_aligned >= (conf_raw + conf_margin)
+        pred_aligned = logits_aligned[:, :n_use].argmax(dim=1)
+        pred_raw = logits_raw[:, :n_use].argmax(dim=1)
+        same_pred = pred_aligned == pred_raw
+        choose_aligned = choose_aligned | (same_pred & (conf_aligned >= conf_raw))
+        blend = min(1.0, max(0.0, float(getattr(self.config, "CAPAV1_DUALTRACK_BLEND", 1.0))))
+        out = logits_raw.clone()
+        if blend < 1.0:
+            blended_logits = blend * logits_aligned[:, :n_use] + (1.0 - blend) * logits_raw[:, :n_use]
+            out[choose_aligned, :n_use] = blended_logits[choose_aligned]
+        else:
+            out[choose_aligned, :n_use] = logits_aligned[choose_aligned, :n_use]
+        if int(logits_aligned.shape[1]) > n_use:
+            out_full = logits_aligned.clone()
+            if blend < 1.0:
+                out_full[:, :n_use] = blend * logits_aligned[:, :n_use] + (1.0 - blend) * logits_raw[:, :n_use]
+            out_full[~choose_aligned, :n_use] = logits_raw[~choose_aligned, :n_use]
+            out = out_full
+        return out
+
+    def _compose_eval_logits(
+        self,
+        z_embed: torch.Tensor,
+        t_protos: torch.Tensor,
+        *,
+        scale: float,
+        baseline_t_protos: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        logits = scale * torch.matmul(z_embed, t_protos.T) + self.b_c
+        if self._uses_dual_track_inference():
+            return self._select_dual_track_logits(
+                logits,
+                z_embed,
+                scale=scale,
+                baseline_t_protos=baseline_t_protos,
+            )
+        logits = self._fuse_with_baseline_logits(
+            logits,
+            z_embed,
+            scale=scale,
+            baseline_t_protos=baseline_t_protos,
+        )
+        return logits
+
+    def _predict_probs(
+        self,
+        logits: torch.Tensor,
+        *,
+        calib_T: float,
+        is_multi: bool,
+        dataset_name: Optional[str],
+        scoring_mode: Optional[str] = None,
+        ranking: bool = False,
+    ) -> torch.Tensor:
+        mode = self._resolve_scoring_mode(scoring_mode)
+        T = 1.0 if ranking else max(float(calib_T), 1e-4)
+
+        if is_multi:
+            if mode == "mixed":
+                return torch.sigmoid(logits / T)
+            return F.softmax(logits / T, dim=1)
+
+        pos_indices = self._get_binary_positive_indices(dataset_name, logits.shape[1])
+        if mode == "mixed":
+            bin_logit = self._binary_logit_from_multiclass(logits / T, pos_indices)
+            return torch.sigmoid(bin_logit)
+
+        probs_full = F.softmax(logits / T, dim=1)
+        return probs_full[:, pos_indices].sum(dim=1).clamp(0.0, 1.0)
+
+    def _go_ml_tau(self, T_sub: torch.Tensor) -> float:
+        # Condition-number-constrained tau selection, cached by |Y|.
+        k = int(T_sub.shape[0])
+        if k <= 1:
+            return float(getattr(self.config, "GO_ML_TAU_BASE", 1e-2))
+        if k in self.go_ml_tau_cache:
+            return float(self.go_ml_tau_cache[k])
+
+        tau_base = max(1e-8, float(getattr(self.config, "GO_ML_TAU_BASE", 1e-2)))
+        cond_target = max(1.01, float(getattr(self.config, "GO_ML_COND_TARGET", 1e3)))
+        G = torch.matmul(T_sub, T_sub.T)
+        try:
+            eigvals = torch.linalg.eigvalsh(G).real
+            lam_max = float(torch.max(eigvals).item())
+            lam_min = float(torch.min(eigvals).item())
+        except RuntimeError:
+            tau = tau_base
+            self.go_ml_tau_cache[k] = tau
+            return tau
+
+        # Need (lam_max + tau) / (lam_min + tau) <= cond_target.
+        num = lam_max - cond_target * lam_min
+        den = cond_target - 1.0
+        tau_needed = max(0.0, num / den) if den > 0 else 0.0
+        tau = max(tau_base, tau_needed + 1e-8)
+        self.go_ml_tau_cache[k] = float(tau)
+        return float(tau)
+
+    def _select_projection_tau(self, T_sub: torch.Tensor, z_img: torch.Tensor) -> float:
+        tau_floor = self._go_ml_tau(T_sub)
+        if (not self._is_professor_profile()) or (not bool(getattr(self.config, "PROF_DYNAMIC_TAU", False))):
+            return float(tau_floor)
+
+        K = int(T_sub.shape[0])
+        if K <= 1:
+            return float(tau_floor)
+
+        G = torch.matmul(T_sub, T_sub.T)
+        rhs = torch.matmul(T_sub, z_img)
+        try:
+            eigvals = torch.linalg.eigvalsh(G).real.clamp_min(1e-12)
+        except RuntimeError:
+            return float(tau_floor)
+
+        tau_hi = max(float(tau_floor) * 100.0, 1.0)
+        candidates = np.unique(
+            np.concatenate(
+                [
+                    np.geomspace(max(float(tau_floor), 1e-6), tau_hi, num=10),
+                    np.asarray([float(tau_floor)], dtype=np.float64),
+                ]
+            )
+        )
+        stats = []
+        D = max(1, int(T_sub.shape[1]))
+        eye = torch.eye(K, device=self.device, dtype=T_sub.dtype)
+        for tau in candidates:
+            tau = float(max(tau, 1e-8))
+            try:
+                alpha = torch.linalg.solve(G + tau * eye, rhs)
+            except RuntimeError:
+                continue
+            recon = torch.matmul(alpha, T_sub)
+            resid = float(torch.norm(z_img - recon).item())
+            sol = float(torch.norm(alpha).item())
+            trace_h = float(torch.sum(eigvals / (eigvals + tau)).item())
+            gcv = (resid ** 2) / max((D - trace_h) ** 2, 1e-8)
+            stats.append((tau, max(resid, 1e-8), max(sol, 1e-8), max(gcv, 1e-8)))
+
+        if len(stats) < 3:
+            return float(tau_floor)
+
+        taus = np.asarray([x[0] for x in stats], dtype=np.float64)
+        log_r = np.log(np.asarray([x[1] for x in stats], dtype=np.float64))
+        log_s = np.log(np.asarray([x[2] for x in stats], dtype=np.float64))
+        log_g = np.log(np.asarray([x[3] for x in stats], dtype=np.float64))
+
+        curvature = np.zeros_like(log_g)
+        for i in range(1, len(taus) - 1):
+            x1, y1 = log_r[i] - log_r[i - 1], log_s[i] - log_s[i - 1]
+            x2, y2 = log_r[i + 1] - log_r[i], log_s[i + 1] - log_s[i]
+            denom = max((x1 * x1 + y1 * y1) ** 1.5, 1e-8)
+            curvature[i] = abs(x1 * y2 - y1 * x2) / denom
+
+        gcv_norm = (log_g - np.mean(log_g)) / (np.std(log_g) + 1e-8)
+        curv_norm = (curvature - np.mean(curvature)) / (np.std(curvature) + 1e-8)
+        score = gcv_norm - 0.25 * curv_norm
+        best_idx = int(np.argmin(score))
+        return float(max(taus[best_idx], tau_floor))
+
+    def _compute_multilabel_residual(self, z_img, active_indices, target_c_idx, t_aligned):
+        other_indices = [idx for idx in active_indices if idx != target_c_idx]
+        if not other_indices:
+            return z_img, 1.0
+
+        T_sub = t_aligned[other_indices]
+        K = int(T_sub.shape[0])
+        G = torch.matmul(T_sub, T_sub.T)
+        use_go_ml = bool(getattr(self.config, "ENABLE_GO_MULTILABEL_PROJECTION", False))
+        tau = self._select_projection_tau(T_sub, z_img) if use_go_ml else float(self.config.MULTI_LABEL_RIDGE)
+        Reg = tau * torch.eye(K, device=self.device, dtype=T_sub.dtype)
+        rhs = torch.matmul(T_sub, z_img)
+        try:
+            alpha = torch.linalg.solve(G + Reg, rhs)
+        except RuntimeError:
+            return z_img, 1.0
+
+        resid_raw = z_img - torch.matmul(alpha, T_sub)
+        resid_norm = float(torch.norm(resid_raw).item())
+        if not np.isfinite(resid_norm) or resid_norm <= 1e-8:
+            return z_img, 1.0
+        return self._l2_norm(resid_raw), resid_norm
+
+    def _labels_to_active_mask(self, y_batch, n_cls: int) -> torch.Tensor:
+        y_arr = np.asarray(y_batch)
+        if y_arr.ndim == 1:
+            out = torch.zeros((len(y_arr), n_cls), dtype=torch.bool, device=self.device)
+            pos = np.where(y_arr > 0)[0]
+            if n_cls > 0 and len(pos) > 0:
+                out[pos, 0] = True
+            return out
+        n_use = min(int(y_arr.shape[1]), int(n_cls))
+        out = torch.zeros((int(y_arr.shape[0]), n_cls), dtype=torch.bool, device=self.device)
+        if n_use > 0:
+            out[:, :n_use] = torch.tensor(y_arr[:, :n_use] > 0, dtype=torch.bool, device=self.device)
+        return out
+
+    def _update_centroids_gt_support(
+        self,
+        z_batch: torch.Tensor,
+        gt_labels,
+        t_aligned: torch.Tensor,
+    ) -> Tuple[int, int, int]:
+        bsz = int(z_batch.shape[0])
+        n_cls = int(t_aligned.shape[0])
+        if self.prior_counts is None or int(self.prior_counts.shape[0]) != n_cls:
+            self.prior_counts = torch.zeros(n_cls, device=self.device, dtype=z_batch.dtype)
+        if self.rejected_counts is None or int(self.rejected_counts.shape[0]) != n_cls:
+            self.rejected_counts = torch.zeros(n_cls, device=self.device, dtype=z_batch.dtype)
+        if self.support_counts is None or int(self.support_counts.shape[0]) != n_cls:
+            self.support_counts = torch.zeros(n_cls, device=self.device, dtype=z_batch.dtype)
+        if gt_labels is None:
+            raise RuntimeError("GT-only mainline requires labels for support updates.")
+
+        gt_active_mask = self._labels_to_active_mask(gt_labels, n_cls=n_cls)
+
+        update_count = 0
+        support_labels = 0
+
+        for i in range(bsz):
+            active_indices = torch.where(gt_active_mask[i])[0].tolist()
+            if not active_indices:
+                continue
+
+            img_vec = z_batch[i]
+
+            for c_idx in active_indices:
+                self.prior_counts[c_idx] += 1.0
+                support_labels += 1
+                self.support_counts[c_idx] += 1.0
+                z_resid, resid_norm = self._compute_multilabel_residual(img_vec, active_indices, c_idx, t_aligned)
+                eta = 1.0 / (float(self.config.KAPPA_EMA) + float(self.support_counts[c_idx].item()))
+                evidence_weight = 1.0
+                if bool(getattr(self.config, "ENABLE_GO_MULTILABEL_PROJECTION", False)) and bool(
+                    getattr(self.config, "GO_ML_USE_RESIDUAL_NORM_WEIGHT", True)
+                ):
+                    evidence_weight *= max(1e-4, float(resid_norm))
+                current_mu = self.image_centroids[c_idx]
+                anchor = t_aligned[c_idx]
+                signal_vec = img_vec
+                if bool(getattr(self.config, "ENABLE_GO_MULTILABEL_PROJECTION", False)) and not bool(
+                    getattr(self.config, "GO_ML_SIGNAL_USE_ORIGINAL", True)
+                ):
+                    signal_vec = z_resid
+                kappa0 = float(self.config.KAPPA0)
+                target = (kappa0 * anchor + evidence_weight * signal_vec) / (kappa0 + evidence_weight + 1e-8)
+                self.image_centroids[c_idx] = self._l2_norm((1.0 - eta) * current_mu + eta * target)
+                update_count += 1
+
+        rejected_labels = 0
+        return update_count, rejected_labels, support_labels
+
+    def _solve_procrustes(self):
+        N = self.support_counts
+        mask = self._get_alignment_active_mask()
+        if mask.sum() == 0:
+            return self.current_R
+
+        t_ref = self._get_alignment_text_base()
+        n_cap = max(1, int(getattr(self.config, "N_CAP", 500)))
+        N_capped = torch.clamp(N, max=float(n_cap))
+        w = (torch.pow(N_capped, self.config.GAMMA_WEIGHT) + self.config.ALPHA_WEIGHT)
+        sim = (self.image_centroids * t_ref).sum(dim=1)
+        w *= (1.0 + self.config.BETA_WEIGHT * torch.clamp(self.config.RHO - sim, min=0))
+        if mask.any():
+            w_med = torch.median(w[mask])
+            w_cap = self.config.PROCRUSTES_WEIGHT_CAP_MULT * (w_med + 1e-6)
+            w = torch.minimum(w, torch.full_like(w, w_cap))
+
+        w = w * mask.float()
+        w = w / w.sum().clamp_min(1e-8)
+        mu = self._l2_norm(self.image_centroids)
+        t_raw = self._l2_norm(t_ref)
+        M_pos = torch.matmul((w.view(-1, 1) * mu).T, t_raw)
+        M_cov = M_pos
+
+        use_hard_neg = bool(getattr(self.config, "ENABLE_HARD_NEG_PROCRUSTES", False))
+        beta = max(0.0, float(getattr(self.config, "HARD_NEG_BETA", 0.0)))
+        topk = int(getattr(self.config, "HARD_NEG_TOPK", 0))
+        temp = max(float(getattr(self.config, "HARD_NEG_TEMP", 0.07)), 1e-4)
+        if use_hard_neg and beta > 0.0 and topk > 0:
+            active_idx = torch.where(mask)[0]
+            n_act = int(active_idx.numel())
+            if n_act > 1:
+                mu_act = mu.index_select(0, active_idx)
+                t_act = t_raw.index_select(0, active_idx)
+                w_act = w.index_select(0, active_idx)
+                sim_cross = torch.matmul(mu_act, t_act.T)
+                sim_cross = sim_cross.masked_fill(
+                    torch.eye(n_act, dtype=torch.bool, device=self.device),
+                    -1e9,
+                )
+                k_eff = max(1, min(topk, n_act - 1))
+                topv, topi = torch.topk(sim_cross, k=k_eff, dim=1, largest=True, sorted=False)
+                a = F.softmax(topv / temp, dim=1)
+                t_hard = (a.unsqueeze(-1) * t_act[topi]).sum(dim=1)
+                M_neg = torch.matmul((w_act.view(-1, 1) * mu_act).T, t_hard)
+                M_cov = M_pos - beta * M_neg
+
+        U, _, Vh = torch.linalg.svd(M_cov)
+        diag = torch.ones(M_cov.shape[1], device=self.device)
+        if torch.det(torch.matmul(U, Vh)) < 0: diag[-1] = -1
+        return torch.matmul(torch.matmul(U, torch.diag(diag)), Vh)
+
+    # === [澧炲己鐗圿 璇婃柇鍑芥暟 ===
+    def _diagnose_and_log_dynamic(self, R_cand, step, phase="Adapt", emit_log: Optional[bool] = None):
+        mask = self._get_alignment_active_mask()
+        n_act = int(mask.sum().item())
+        if n_act == 0:
+            return {"passed": False, "dS": 0.0, "n_act": 0}
+
+        T = self._get_alignment_text_base()
+        Mu = self.image_centroids
+        T_rot = torch.matmul(T, R_cand.T)
+        I = torch.eye(R_cand.shape[0], device=self.device)
+        ortho_err = torch.norm(torch.matmul(R_cand, R_cand.T) - I).item()
+
+        Sim_post = torch.matmul(Mu, T_rot.T)
+        Sim_pre = torch.matmul(Mu, T.T)
+        sim_before_vec = Sim_pre.diag()[mask]
+        sim_before_post_vec = Sim_post.diag()[mask]
+        sim_before = float(sim_before_vec.mean().item())
+        valid_sim = float(sim_before_post_vec.mean().item())
+        diag_gain_vec = sim_before_post_vec - sim_before_vec
+        min_diag_gain = float(diag_gain_vec.min().item())
+        neg_diag_gain_mass = float(torch.clamp(-diag_gain_vec, min=0.0).sum().item())
+        neg_diag_gain_count = int((diag_gain_vec < 0).sum().item())
+
+        idx = torch.where(mask)[0]
+        if int(idx.numel()) > 1:
+            Sim_pre_act = Sim_pre.index_select(0, idx).index_select(1, idx)
+            Sim_post_act = Sim_post.index_select(0, idx).index_select(1, idx)
+            off_diag_mask = ~torch.eye(int(idx.numel()), dtype=torch.bool, device=self.device)
+            off_diag_pre_mean = float(Sim_pre_act[off_diag_mask].mean().item())
+            off_diag_post_mean = float(Sim_post_act[off_diag_mask].mean().item())
+            off_diag_delta = float(off_diag_post_mean - off_diag_pre_mean)
+        else:
+            Sim_pre_act = None
+            off_diag_pre_mean = 0.0
+            off_diag_post_mean = 0.0
+            off_diag_delta = 0.0
+
+        delta = float(valid_sim - sim_before)
+        if bool(getattr(self.config, "GATE_USE_RHO_QUANTILE", False)) and int(sim_before_vec.numel()) > 0:
+            q = min(1.0, max(0.0, float(getattr(self.config, "RHO_QUANTILE", 0.70))))
+            rho_eff = float(torch.quantile(sim_before_vec.detach(), q).item())
+        else:
+            rho_eff = float(self.config.RHO)
+        if not np.isfinite(rho_eff):
+            rho_eff = float(self.config.RHO)
+
+        offdiag_limit = float(getattr(self.config, "GATE_MAX_OFFDIAG_DELTA", 0.0))
+        gain_frac = max(0.0, float(getattr(self.config, "CAPAV1_DYNAMIC_OFFDIAG_FRAC", 0.30)))
+        adaptive_limit = gain_frac * max(delta, 0.0)
+        if offdiag_limit > 0.0:
+            offdiag_limit = max(0.0, min(offdiag_limit, adaptive_limit) if adaptive_limit > 0.0 else offdiag_limit)
+        else:
+            offdiag_limit = max(0.0, adaptive_limit)
+        if bool(getattr(self.config, "GATE_REQUIRE_OFFDIAG_IMPROVEMENT", True)):
+            offdiag_ok = off_diag_delta <= offdiag_limit
+        else:
+            offdiag_ok = True
+
+        eps_eff = float(self.config.EPSILON)
+        if bool(getattr(self.config, "PROF_DYNAMIC_EPSILON", False)) and Sim_pre_act is not None and int(idx.numel()) > 1:
+            hardest_nonmatch = Sim_pre_act.masked_fill(
+                torch.eye(int(idx.numel()), dtype=torch.bool, device=self.device),
+                -1e9,
+            ).max(dim=1).values
+            mean_gap = float((sim_before_vec - hardest_nonmatch).mean().item())
+            eps_eff = max(1e-6, float(getattr(self.config, "PROF_EPSILON_GAP_PCT", 0.015)) * max(mean_gap, 1e-6))
+
+        rho_ok = valid_sim <= rho_eff
+        gain_to_offdiag = float("inf") if off_diag_delta <= 1e-8 else float(delta / max(off_diag_delta, 1e-8))
+        if not rho_ok:
+            active_margin = max(0, int(getattr(self.config, "CAPAV1_RHO_BYPASS_ACTIVE_MARGIN", 2)))
+            relaxed_ratio = max(1.0, float(getattr(self.config, "CAPAV1_RELAXED_GAIN_OFFDIAG_RATIO", 2.5)))
+            relaxed_min_active = min(len(mask), int(self.config.MIN_CLASSES_FOR_ADAPTATION) + active_margin)
+            rho_ok = (gain_to_offdiag >= relaxed_ratio) and (n_act >= int(relaxed_min_active))
+
+        passed = (delta >= eps_eff) and rho_ok and offdiag_ok
+
+        if emit_log is None:
+            emit_log = bool(self.config.VERBOSE)
+        if emit_log:
+            tqdm.write(
+                f" Diagnostic Step {step} ({phase}) | Active {n_act}/{len(mask)} "
+                f"| dS={delta:+.4f} | eps*={eps_eff:.4f} | dOffDiag={off_diag_delta:+.4f} "
+                f"| dOff*={offdiag_limit:.4f} | rho*={rho_eff:.4f} | OrthoErr={ortho_err:.2e} | Passed={passed}"
+            )
+
+        return {
+            "passed": passed,
+            "dS": delta,
+            "s_after": valid_sim,
+            "n_act": n_act,
+            "dOffDiag": off_diag_delta,
+            "dOffDiagLimit": offdiag_limit,
+            "gain_to_offdiag": gain_to_offdiag,
+            "min_diag_gain": min_diag_gain,
+            "neg_diag_gain_mass": neg_diag_gain_mass,
+            "neg_diag_gain_count": neg_diag_gain_count,
+            "rho_eff": rho_eff,
+            "eps_eff": eps_eff,
+            "off_diag_pre_mean": off_diag_pre_mean,
+            "off_diag_post_mean": off_diag_post_mean,
+        }
+
+    def _save_and_report_per_class(self):
+        self._log("\n[Report] Saving per-class stats...")
+        # 1. Safety Check (Compression)
+        T_base = self._get_alignment_text_base()
+        T_rot = torch.matmul(T_base, self.R_frozen.T)
+        
+        Sim_Pre = torch.matmul(self.image_centroids, T_base.T)
+        Sim_Post = torch.matmul(self.image_centroids, T_rot.T)
+        
+        off_mask = ~torch.eye(Sim_Post.shape[0], dtype=torch.bool, device=self.device)
+        off_mean_pre = Sim_Pre[off_mask].mean().item()
+        off_mean_post = Sim_Post[off_mask].mean().item()
+        
+        self._log(f" Safety Check: Off-Diagonal Change = {off_mean_post - off_mean_pre:+.6f}")
+        
+        if off_mean_post > off_mean_pre + 0.01:
+            self._log("[WARN] Compression risk: off-diagonal similarity increased.")
+
+        run_tag = getattr(self, "config_name", f"seed{self.config.RANDOM_SEED}")
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        csv_path = os.path.join(self.config.SAVE_DIR, f"per_class_stats_{run_tag}_{timestamp}.csv")
+        self._log(f"[Saved] {csv_path}")
+
+        # 2. Per-Class Snapshot Table
+        N = self.support_counts
+        mask = self._get_alignment_active_mask()
+        n_cap = max(1, int(getattr(self.config, "N_CAP", 500)))
+        N_capped = torch.clamp(N, max=float(n_cap))
+        w_raw = (torch.pow(N_capped, self.config.GAMMA_WEIGHT) + self.config.ALPHA_WEIGHT)
+        
+        sim_raw = (self.image_centroids * T_base).sum(dim=1)
+        sim_rot = (self.image_centroids * T_rot).sum(dim=1) 
+        
+        w_final = w_raw * (1.0 + self.config.BETA_WEIGHT * torch.clamp(self.config.RHO - sim_raw, min=0))
+        w_median_val = w_final[mask].median().item() if mask.any() else 0.0
+        leverage = torch.zeros_like(w_final)
+        if mask.any():
+            leverage[mask] = w_final[mask] / (w_median_val + 1e-6)
+        
+        rows = []
+        for i, name in enumerate(self.config.ORDERED_CLASS_NAMES):
+            if not mask[i]: continue
+            rows.append({
+                "name": name,
+                "n": int(N[i].item()),
+                "sim_pre": sim_raw[i].item(),
+                "sim_post": sim_rot[i].item(),
+                "gain": sim_rot[i].item() - sim_raw[i].item(),
+                "weight": w_final[i].item(),
+                "leverage": leverage[i].item()
+            })
+        
+        rows.sort(key=lambda x: x["leverage"], reverse=True)
+        if rows:
+            non_support = [r for r in rows if r["name"] != "Support Devices"]
+            preferred = non_support[0] if non_support else rows[0]
+            self.max_leverage_info = f"{preferred['name']} ({preferred['leverage']:.2f})"
+            self._log(f" [Info] Max leverage class: {self.max_leverage_info}")
+        
+        if self.config.VERBOSE:
+            self._log("\n Per-Class Snapshot (Sorted by Leverage - Impact on Rotation):")
+            header = f"{'Class Name':>40}  {'Support (N)':>11}  {'Sim (Before)':>12}  {'Sim (After)':>12}   {'Gain':>6}  {'Weight (w_c)':>12}  {'Leverage':>10}"
+            self._log(header)
+            for r in rows:
+                self._log(f"{r['name']:>40}  {r['n']:11d}  {r['sim_pre']:12.4f}  {r['sim_post']:12.4f} {r['gain']:+.4f}  {r['weight']:12.2f}  {r['leverage']:10.2f}")
+        
+        pd.DataFrame(rows).to_csv(csv_path, index=False)
+
+        # 3. Save State (after leverage is computed)
+        state_path = os.path.join(self.config.SAVE_DIR, "capa_state.pkl")
+        guardian_blob = {
+            "enabled": bool(self._is_go_guardian_enabled()),
+            "status": str(self.guardian_status),
+            "psi_thr": float(getattr(self.config, "GO_PSI_THR", 2.0)),
+            "tau_resume": float(getattr(self.config, "GO_TAU_RESUME", 1.0)),
+            "resume_windows": int(getattr(self.config, "GO_RESUME_WINDOWS", 3)),
+            "warmup_steps": int(getattr(self.config, "GO_WARMUP_STEPS", 50)),
+            "baseline_collect_steps": int(getattr(self.config, "GO_BASELINE_COLLECT_STEPS", 50)),
+            "dry_run": bool(getattr(self.config, "GO_DRY_RUN", False)),
+            "last_psi": float(self.guardian_last_psi) if np.isfinite(self.guardian_last_psi) else np.nan,
+            "num_alarms": int(self.guardian_num_alarms),
+            "last_alarm_step": int(self.guardian_last_alarm_step),
+            "psi_history": list(self.guardian_psi_history[-512:]),
+            "psi_baseline_hist": self.guardian_psi_baseline_hist,
+            "psi_bin_edges": self.guardian_psi_bin_edges,
+            "baseline_samples": int(len(self.guardian_baseline_values)),
+        }
+        state_dict = {
+            "line_mode": "capav1_gt",
+            "centroids": self.image_centroids.cpu(),
+            "centroids_last_good": self.centroids_last_good.cpu() if isinstance(self.centroids_last_good, torch.Tensor) else None,
+            "R": self.R_frozen.cpu(),
+            "R_last_good": self.R_last_good.cpu() if isinstance(self.R_last_good, torch.Tensor) else None,
+            "support_counts": self.support_counts.cpu(),
+            "rejected_counts": self.rejected_counts.cpu() if isinstance(self.rejected_counts, torch.Tensor) else None,
+            "prior_counts": self.prior_counts.cpu() if isinstance(self.prior_counts, torch.Tensor) else None,
+            "alignment_stats": self.final_alignment_stats,
+            "max_leverage": self.max_leverage_info,
+            "t_align_base": T_base.detach().cpu(),
+            "t_mixed": T_base.detach().cpu(),
+            "t_raw_pooled": self.t_raw_pooled.detach().cpu(),
+            "guardian": guardian_blob,
+        }
+        with open(state_path, "wb") as f:
+            pickle.dump(state_dict, f)
+        self._log(f"[Saved] {state_path}")
+
+    def _orthogonalize_rotation(self, M: torch.Tensor) -> torch.Tensor:
+        U, _, Vh = torch.linalg.svd(M)
+        diag = torch.ones(M.shape[0], device=M.device, dtype=M.dtype)
+        if torch.det(torch.matmul(U, Vh)) < 0:
+            diag[-1] = -1
+        return torch.matmul(torch.matmul(U, torch.diag(diag)), Vh)
+
+    def _alignment_stats_score(self, stats: Dict[str, float]) -> float:
+        dS = float(stats.get("dS", 0.0))
+        dOff = max(0.0, float(stats.get("dOffDiag", 0.0)))
+        dOff_lim = max(0.0, float(stats.get("dOffDiagLimit", 0.0)))
+        off_violation = max(0.0, dOff - dOff_lim)
+        min_diag_gain = float(stats.get("min_diag_gain", 0.0))
+        neg_gain_mass = max(0.0, float(stats.get("neg_diag_gain_mass", 0.0)))
+        rho_gap = max(0.0, float(stats.get("s_after", 0.0)) - float(stats.get("rho_eff", self.config.RHO)))
+        eps_gap = max(0.0, float(stats.get("eps_eff", self.config.EPSILON)) - dS)
+        ratio = float(stats.get("gain_to_offdiag", 0.0))
+        if not np.isfinite(ratio):
+            ratio = 5.0
+        ratio_bonus = min(max(ratio, 0.0), 5.0)
+        n_act_bonus = 0.01 * min(int(stats.get("n_act", 0)), len(self.config.ORDERED_CLASS_NAMES))
+        pass_bonus = 0.05 if bool(stats.get("passed", False)) else 0.0
+        min_gain_penalty = max(0.0, -min_diag_gain)
+        return (
+            dS
+            - 0.75 * dOff
+            - 1.25 * off_violation
+            - 0.80 * neg_gain_mass
+            - 0.60 * min_gain_penalty
+            - 0.50 * rho_gap
+            - 0.50 * eps_gap
+            + 0.01 * ratio_bonus
+            + n_act_bonus
+            + pass_bonus
+        )
+
+    def _is_soft_fallback_acceptable(self, stats: Dict[str, float]) -> bool:
+        if int(stats.get("n_act", 0)) < int(self.config.MIN_CLASSES_FOR_ADAPTATION):
+            return False
+        min_gain = max(float(getattr(self.config, "CAPAV1_SOFT_FALLBACK_MIN_GAIN", 0.03)), 5.0 * float(self.config.EPSILON))
+        dS = float(stats.get("dS", 0.0))
+        dOff = max(0.0, float(stats.get("dOffDiag", 0.0)))
+        dOff_lim = max(0.0, float(stats.get("dOffDiagLimit", 0.0)))
+        offdiag_mult = max(1.0, float(getattr(self.config, "CAPAV1_SOFT_FALLBACK_OFFDIAG_MULT", 1.50)))
+        max_soft_offdiag = max(0.03, dOff_lim * offdiag_mult, dOff_lim + 0.02)
+        ratio = float(stats.get("gain_to_offdiag", 0.0))
+        if not np.isfinite(ratio):
+            ratio = 5.0
+        return (dS >= min_gain) and (dOff <= max_soft_offdiag) and (ratio >= 1.0)
+
+    def _select_guarded_alignment_candidate(
+        self,
+        R_full: torch.Tensor,
+        step: int,
+        *,
+        phase: str = "Adapt",
+        allow_soft_fallback: bool = False,
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        full_stats = self._diagnose_and_log_dynamic(R_full, step, phase=phase, emit_log=False)
+        full_stats["alpha"] = 1.0
+        full_stats["selection_mode"] = "full"
+        full_stats["mix_base"] = "full"
+        full_stats["score"] = self._alignment_stats_score(full_stats)
+        best_hard = (full_stats["score"], R_full, dict(full_stats)) if bool(full_stats.get("passed", False)) else None
+        hard_candidates: List[Tuple[float, torch.Tensor, Dict[str, float]]] = []
+        if best_hard is not None:
+            hard_candidates.append((full_stats["score"], R_full, dict(full_stats)))
+        best_soft = None
+        if allow_soft_fallback and self._is_soft_fallback_acceptable(full_stats):
+            best_soft = (full_stats["score"], R_full, dict(full_stats))
+        candidate_dump: List[Dict[str, float]] = [dict(full_stats)]
+
+        identity = torch.eye(R_full.shape[0], device=self.device, dtype=R_full.dtype)
+        anchor = self.current_R if isinstance(self.current_R, torch.Tensor) and self.current_R.shape == R_full.shape else identity
+        alpha_list = []
+        alpha_source = list(getattr(self.config, "CAPAV1_GUARDED_ALPHAS", [1.0, 0.85, 0.70, 0.55, 0.40, 0.25]))
+        for alpha in alpha_source:
+            a = float(alpha)
+            if a <= 0.0 or a > 1.0:
+                continue
+            if not any(abs(a - prev) < 1e-6 for prev in alpha_list):
+                alpha_list.append(a)
+        if not any(abs(1.0 - prev) < 1e-6 for prev in alpha_list):
+            alpha_list.insert(0, 1.0)
+        alpha_list = sorted(alpha_list, reverse=True)
+
+        for alpha in alpha_list:
+            if abs(alpha - 1.0) < 1e-6:
+                continue
+            mixed = (1.0 - alpha) * anchor + alpha * R_full
+            R_try = self._orthogonalize_rotation(mixed)
+            stats = self._diagnose_and_log_dynamic(R_try, step, phase=phase, emit_log=False)
+            stats["alpha"] = alpha
+            stats["mix_base"] = "anchor"
+            stats["selection_mode"] = "guarded"
+            stats["score"] = self._alignment_stats_score(stats)
+            candidate_dump.append(dict(stats))
+            if bool(stats.get("passed", False)):
+                hard_candidates.append((stats["score"], R_try, dict(stats)))
+                if (best_hard is None) or (stats["score"] > best_hard[0]):
+                    best_hard = (stats["score"], R_try, dict(stats))
+            if allow_soft_fallback and self._is_soft_fallback_acceptable(stats):
+                if (best_soft is None) or (stats["score"] > best_soft[0]):
+                    best_soft = (stats["score"], R_try, dict(stats))
+
+        if hard_candidates:
+            tol = max(0.0, float(getattr(self.config, "CAPAV1_SMALLER_ALPHA_SCORE_TOL", 0.015)))
+            min_gain_frac = min(1.0, max(0.0, float(getattr(self.config, "CAPAV1_SMALLER_ALPHA_MIN_GAIN_FRAC", 0.40))))
+            best_hard_score = max(float(item[0]) for item in hard_candidates)
+            max_hard_gain = max(float(item[2].get("dS", 0.0)) for item in hard_candidates)
+            conservative_pool = [
+                item
+                for item in hard_candidates
+                if float(item[0]) >= (best_hard_score - tol)
+                and float(item[2].get("dS", 0.0)) >= (max_hard_gain * min_gain_frac)
+            ]
+            if conservative_pool:
+                conservative_pool.sort(
+                    key=lambda item: (
+                        float(item[2].get("alpha", 1.0)),
+                        -float(item[0]),
+                    )
+                )
+                best_hard = conservative_pool[0]
+                best_hard[2]["selection_mode"] = "guarded_conservative"
+
+        chosen = best_hard
+        if chosen is None and allow_soft_fallback and best_soft is not None:
+            chosen = best_soft
+            chosen[2]["soft_fallback"] = True
+        if chosen is None:
+            chosen = (full_stats["score"], R_full, dict(full_stats))
+
+        _, R_sel, stats_sel = chosen
+        stats_sel.setdefault("soft_fallback", False)
+        if self.config.VERBOSE:
+            if bool(getattr(self.config, "CAPAV1_GUARDED_DUMP", False)):
+                for item in sorted(candidate_dump, key=lambda x: float(x.get("alpha", 1.0)), reverse=True):
+                    tqdm.write(
+                        " [GuardedCand] "
+                        f"a={float(item.get('alpha', 1.0)):.2f} "
+                        f"| base={str(item.get('mix_base', 'full'))} "
+                        f"| pass={bool(item.get('passed', False))} "
+                        f"| dS={float(item.get('dS', 0.0)):+.4f} "
+                        f"| dOff={float(item.get('dOffDiag', 0.0)):+.4f} "
+                        f"| minGain={float(item.get('min_diag_gain', 0.0)):+.4f} "
+                        f"| negMass={float(item.get('neg_diag_gain_mass', 0.0)):.4f} "
+                        f"| score={float(item.get('score', 0.0)):+.4f}"
+                    )
+            diag_stats = self._diagnose_and_log_dynamic(R_sel, step, phase=phase, emit_log=True)
+            diag_stats["alpha"] = float(stats_sel.get("alpha", 1.0))
+            diag_stats["mix_base"] = str(stats_sel.get("mix_base", "full"))
+            diag_stats["selection_mode"] = str(stats_sel.get("selection_mode", "full"))
+            diag_stats["score"] = float(stats_sel.get("score", self._alignment_stats_score(diag_stats)))
+            diag_stats["soft_fallback"] = bool(stats_sel.get("soft_fallback", False))
+            stats_sel = diag_stats
+            tqdm.write(
+                f" [GuardedR] alpha={float(stats_sel.get('alpha', 1.0)):.2f} "
+                f"| base={stats_sel.get('mix_base', 'full')} "
+                f"| mode={stats_sel.get('selection_mode', 'full')} "
+                f"| score={float(stats_sel.get('score', 0.0)):+.4f} "
+                f"| soft={bool(stats_sel.get('soft_fallback', False))}"
+            )
+        return R_sel, stats_sel
+
+    def _commit_alignment_candidate(self, R_cand: torch.Tensor, stats: Dict[str, float], gate_pass: bool) -> None:
+        self.current_R = R_cand
+        self.R_frozen = R_cand
+        self._snapshot_last_good_state()
+
+        t_base_eval = self._get_alignment_text_base()
+        T_rot = torch.matmul(t_base_eval, R_cand.T)
+        Sim = torch.matmul(self.image_centroids, T_rot.T)
+        Sim_pre = torch.matmul(self.image_centroids, t_base_eval.T)
+        off_diag_mask = ~torch.eye(Sim.shape[0], dtype=torch.bool, device=self.device)
+        self.final_alignment_stats = {
+            "dS_gain": float(stats.get("dS", 0.0)),
+            "n_act": int(stats.get("n_act", 0)),
+            "off_diag_mean": Sim[off_diag_mask].mean().item(),
+            "off_diag_max": Sim[off_diag_mask].max().item(),
+            "off_diag_pre_mean": Sim_pre[off_diag_mask].mean().item(),
+            "support_count": float(self.support_counts.sum().item()) if self.support_counts is not None else 0.0,
+            "gate_pass": bool(gate_pass),
+            "selection_alpha": float(stats.get("alpha", 1.0)),
+            "selection_mix_base": str(stats.get("mix_base", "full")),
+            "selection_mode": str(stats.get("selection_mode", "full")),
+            "selection_score": float(stats.get("score", 0.0)),
+            "soft_fallback": bool(stats.get("soft_fallback", False)),
+        }
+
+    def run_pipeline(self):
+        self._log("[Stage I] Calibration")
+        z_cal, _, _ = self._load_data(
+            self.config.CALIB_DATA_PATH,
+            is_calibration=True,
+            split_override=1,
+        )
+        self.zI_mean = z_cal.mean(dim=0, keepdim=True)
+        d_feat = int(z_cal.shape[1])
+        n_cal = int(len(z_cal))
+        min_cov_n = max(2, d_feat + 1)
+        if self.config.USE_ZCA_WHITEN and n_cal >= min_cov_n:
+            cov = torch.matmul((z_cal - self.zI_mean).T, (z_cal - self.zI_mean)) / max(1, (n_cal - 1))
+            try:
+                U, S, Vh = torch.linalg.svd(cov)
+                self.W_zca = torch.matmul(torch.matmul(U, torch.diag(1.0 / torch.sqrt(S + 1e-5))), Vh)
+            except RuntimeError as e:
+                self.W_zca = torch.eye(d_feat, device=self.device)
+                self._log(f"[Stage I] Whitening SVD failed ({e}); fallback to identity.", always=True)
+        else:
+            self.W_zca = torch.eye(d_feat, device=self.device)
+            if self.config.USE_ZCA_WHITEN:
+                self._log(
+                    f"[Stage I] Whitening skipped: n={n_cal} < d+1={min_cov_n}; fallback to identity.",
+                    always=True,
+                )
+        self._build_prototypes()
+
+        d = self.t_raw_pooled.shape[1]
+        self.current_R = torch.eye(d, device=self.device)
+        self.R_frozen = torch.eye(d, device=self.device)
+        self.image_centroids = self.t_raw_pooled.clone()
+        self.support_counts = torch.zeros(self.t_raw_pooled.shape[0], device=self.device)
+        self.rejected_counts = torch.zeros_like(self.support_counts)
+        self.prior_counts = torch.zeros_like(self.support_counts)
+        self.t_align_base = self.t_raw_pooled.clone()
+        self._set_prior_bias_from_counts(self.prior_counts)
+        self._snapshot_last_good_state()
+        z_cal_proc = self._apply_preprocessing(z_cal, self.zI_mean)
+        self._apply_param_profile_from_calibration(z_cal_proc)
+
+        # GO Guardian baseline is collected online after GO warmup steps.
+        self.guardian_status = "off"
+        self.guardian_last_alarm_step = -1
+        self.guardian_num_alarms = 0
+        self.guardian_resume_streak = 0
+        self.guardian_last_psi = np.nan
+        self.guardian_psi_history = []
+        self.guardian_psi_baseline_hist = None
+        self.guardian_psi_bin_edges = None
+        self.guardian_baseline_values = []
+        self.guardian_window_values = []
+        saved_state = False
+        best_soft_candidate_R = None
+        best_soft_candidate_stats = None
+        best_soft_candidate_score = -float("inf")
+
+        self._log(f"[Stage III] GT Support Adaptation (warmup={self.config.WARMUP_BATCHES} batches)")
+        z_train, y_train, _ = self._load_data(self.config.TRAIN_DATA_PATH, split_override=0)
+        z_train = self._apply_preprocessing(z_train, self.zI_mean)
+        if y_train is None:
+            raise RuntimeError("capav1_gt requires labels in TRAIN_DATA_PATH for GT evidence routing.")
+        
+        B = self.config.TRAIN_BATCH_SIZE
+        
+        pbar = tqdm(range(0, len(z_train), B), desc=" Init Warmup", disable=(not self.config.VERBOSE),
+                   bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]")
+        
+        for i in pbar:
+            if self.is_frozen: break
+            z_b = z_train[i:i+B]
+            y_b = None if y_train is None else y_train[i:i+B]
+            step = i // B
+            
+            is_warmup = step < self.config.WARMUP_BATCHES
+            
+            if is_warmup:
+                R_inference = torch.eye(d, device=self.device)
+                phase_name = "WarmUp"
+            else:
+                R_inference = self.current_R
+                phase_name = "Adapt"
+                
+            t_base = self._get_alignment_text_base()
+            t_aligned = self._l2_norm(torch.matmul(t_base, R_inference.T))
+            logits = self.s_opt * torch.matmul(z_b, t_aligned.T) + self.b_c
+            probs = torch.sigmoid(logits / self.T_opt)
+
+            g_info = self._guardian_update_from_window(step, probs)
+            if g_info is not None and bool(g_info.get("changed", False)):
+                if bool(g_info.get("frozen", False)):
+                    self._log(
+                        f"[GO] Alarm -> freeze at step={step}, PSI={float(g_info['psi']):.4f}, rollback to R_last_good.",
+                        always=True,
+                    )
+                else:
+                    self._log(
+                        f"[GO] Resume at step={step}, PSI={float(g_info['psi']):.4f}.",
+                        always=True,
+                    )
+            elif g_info is not None and bool(g_info.get("dry_run", False)) and np.isfinite(float(g_info.get("psi", np.nan))):
+                if float(g_info["psi"]) > float(getattr(self.config, "GO_PSI_THR", 2.0)):
+                    self._log(
+                        f"[GO][DryRun] Alarm candidate at step={step}, PSI={float(g_info['psi']):.4f} (no freeze).",
+                        always=True,
+                    )
+
+            if self._guardian_is_frozen():
+                n_updates, n_rejected, n_support = 0, 0, 0
+                if isinstance(self.R_last_good, torch.Tensor):
+                    self.current_R = self.R_last_good.clone()
+                    self.R_frozen = self.R_last_good.clone()
+                    if isinstance(self.centroids_last_good, torch.Tensor):
+                        self.image_centroids = self.centroids_last_good.clone()
+            else:
+                n_updates, n_rejected, n_support = self._update_centroids_gt_support(
+                    z_b,
+                    y_b,
+                    t_aligned,
+                )
+                self._set_prior_bias_from_counts(self.prior_counts)
+            
+            # === 瀹炴椂璁＄畻 Mask 鍜?璁℃暟 ===
+            mask = self._get_alignment_active_mask()
+            n_act = mask.sum().item()
+            n_total = len(self.config.ORDERED_CLASS_NAMES)
+            
+            pbar_metrics = {
+                "Ph": phase_name, 
+                "N_act": f"{n_act}/{n_total}",
+                "Upd": f"{n_updates}",
+                "SUP": f"{n_support}",
+                "REJ": f"{n_rejected}",
+                "G": str(self.guardian_status),
+                "PSI": f"{float(self.guardian_last_psi):.4f}" if np.isfinite(self.guardian_last_psi) else "NA",
+            }
+            
+            check_gate = False
+            if self._guardian_is_frozen():
+                if self.config.VERBOSE:
+                    pbar.set_description(" GuardianFrozen")
+            else:
+                if is_warmup:
+                    if self.config.VERBOSE:
+                        pbar.set_description(f" Warmup {step}/{self.config.WARMUP_BATCHES}")
+                elif step == self.config.WARMUP_BATCHES:
+                    check_gate = True
+                    if self.config.PRINT_SUMMARY:
+                        self._log("\n[Warmup Complete] Checking constraints...")
+                else:
+                    if self.config.VERBOSE:
+                        pbar.set_description(" Adapting")
+                    if step % 5 == 0:
+                        check_gate = True
+
+            if check_gate:
+                # Start adaptation only when enough classes are active.
+                MIN_CLASSES_FOR_ADAPTATION = self.config.MIN_CLASSES_FOR_ADAPTATION
+                
+                if n_act < MIN_CLASSES_FOR_ADAPTATION:
+                    if self.config.VERBOSE and (step % 10 == 0 or step == self.config.WARMUP_BATCHES):
+                        tqdm.write(f" [Gate Held] Too few active classes ({n_act}/{n_total}). Need at least {MIN_CLASSES_FOR_ADAPTATION}.")
+                else:
+                    self.t_align_base = self.t_raw_pooled.clone()
+                    # 鏈夎冻澶熺被鍒椂锛岃绠?R锛坃solve_procrustes 鍐呴儴浼氳嚜鍔ㄥ拷鐣ユ牱鏈笉瓒崇殑绫诲埆锛?
+                    R_full = self._solve_procrustes()
+                    R_cand, stats = self._select_guarded_alignment_candidate(
+                        R_full,
+                        step,
+                        phase=phase_name,
+                        allow_soft_fallback=True,
+                    )
+                    pbar_metrics.update(
+                        {
+                            "dS": f"{stats['dS']:.4f}",
+                            "dOff": f"{float(stats.get('dOffDiag', 0.0)):+.4f}",
+                            "rho*": f"{float(stats.get('rho_eff', self.config.RHO)):.3f}",
+                            "a": f"{float(stats.get('alpha', 1.0)):.2f}",
+                        }
+                    )
+                    
+                    if stats["passed"]:
+                        self._commit_alignment_candidate(R_cand, stats, gate_pass=True)
+                        
+                        # 鍒嗗眰鍐荤粨绛栫暐锛?
+                        # 1. 濡傛灉瑕嗙洊鐜囬珮锛?80%锛変笖鎸囨爣鍚堟牸 鈫?褰诲簳鍐荤粨閫€鍑?
+                        # 2. 鍚﹀垯鍙洿鏂板弬鏁帮紝缁х画鏀堕泦鏇村绫诲埆鐨勬暟鎹?
+                        coverage_ratio = n_act / n_total
+                        if coverage_ratio >= 0.8:
+                            self.is_frozen = True
+                            pbar.set_postfix(pbar_metrics)
+                            self._log(f"[Gate Passed] Freeze R at step={step} (coverage={coverage_ratio:.1%}, 螖s={stats['dS']:.4f})")
+                            self._save_and_report_per_class()
+                            saved_state = True
+                            pbar.close()
+                            break
+                        else:
+                            # 鍙傛暟鏇存柊浣嗕笉鍐荤粨锛岀户缁€傚簲
+                            self._log(f" [Update] R updated with {n_act}/{n_total} classes ({coverage_ratio:.1%}).")
+                    elif bool(stats.get("soft_fallback", False)):
+                        soft_score = float(stats.get("score", self._alignment_stats_score(stats)))
+                        if soft_score > best_soft_candidate_score:
+                            best_soft_candidate_score = soft_score
+                            best_soft_candidate_R = R_cand.clone()
+                            best_soft_candidate_stats = dict(stats)
+                            self._log(
+                                f" [SoftFallback] Tracking best GT candidate at step={step} "
+                                f"(alpha={float(stats.get('alpha', 1.0)):.2f}, dS={float(stats.get('dS', 0.0)):+.4f}, "
+                                f"dOff={float(stats.get('dOffDiag', 0.0)):+.4f})."
+                            )
+                    elif step == self.config.WARMUP_BATCHES:
+                        self._log(f" [Gate Failed] Warmup insufficient (螖s={stats['dS']:.4f}).")
+
+            if self.config.VERBOSE:
+                pbar.set_postfix(pbar_metrics)
+            
+        if not self.is_frozen:
+            if isinstance(best_soft_candidate_R, torch.Tensor) and isinstance(best_soft_candidate_stats, dict):
+                self._commit_alignment_candidate(best_soft_candidate_R, best_soft_candidate_stats, gate_pass=False)
+                self._log(
+                    f"[WARN] Loop finished without freezing; using best GT soft fallback "
+                    f"(alpha={float(best_soft_candidate_stats.get('alpha', 1.0)):.2f}, dS={float(best_soft_candidate_stats.get('dS', 0.0)):+.4f}).",
+                    always=True,
+                )
+            else:
+                self._log("[WARN] Loop finished without freezing; using latest R for evaluation.")
+                if self.current_R is None:
+                    self.current_R = torch.eye(d, device=self.device)
+                self.R_frozen = self.current_R
+                self._snapshot_last_good_state()
+        final_prior_counts = self.prior_counts if self.prior_counts is not None else self.support_counts
+        self._set_prior_bias_from_counts(final_prior_counts)
+        if not saved_state:
+            self._save_and_report_per_class()
+
+        self._run_evaluation()
+        self._run_scale_sweep([8, 12, 16, 24, 32, 40])
+
+    def _compute_ece(self, y_true, y_prob, n_bins=10):
+        """
+        璁＄畻 Expected Calibration Error (ECE)銆?
+        琛￠噺鐢变簬 TTA 瀵艰嚧鐨勬ā鍨嬭繃搴﹁嚜淇?Overconfidence)绋嬪害銆?
+        """
+        bin_boundaries = np.linspace(0, 1, n_bins + 1)
+        bin_lowers = bin_boundaries[:-1]
+        bin_uppers = bin_boundaries[1:]
+
+        # 纭繚杞负 1D 鏁扮粍杩涜鍏ㄥ眬璁＄畻 (Micro-level ECE)
+        y_true_flat = y_true.flatten()
+        y_prob_flat = y_prob.flatten()
+        
+        ece = 0.0
+        for bin_lower, bin_upper in zip(bin_lowers, bin_uppers):
+            # 钀藉湪杩欎釜缃俊搴﹀尯闂村唴鐨勬牱鏈?
+            in_bin = (y_prob_flat > bin_lower) & (y_prob_flat <= bin_upper)
+            prop_in_bin = in_bin.mean()
+            
+            if prop_in_bin > 0:
+                accuracy_in_bin = y_true_flat[in_bin].mean()
+                avg_confidence_in_bin = y_prob_flat[in_bin].mean()
+                ece += np.abs(avg_confidence_in_bin - accuracy_in_bin) * prop_in_bin
+
+        return ece * 100.0  # 杞负鐧惧垎姣?
+
+    def _compute_metrics(
+        self,
+        z_test,
+        y_test,
+        is_multi,
+        t_protos,
+        scale_override: Optional[float] = None,
+        temperature_override: Optional[float] = None,
+        dataset_name: Optional[str] = None,
+        scoring_mode: Optional[str] = None,
+        use_cache: bool = False,
+        baseline_t_protos: Optional[torch.Tensor] = None,
+    ):
+        """Compute metrics under selected scoring mode. AUC uses T=1.0 ranking scores."""
+        scale = self.s_opt if scale_override is None else scale_override
+        calib_T = self.T_opt if temperature_override is None else max(temperature_override, 1e-4)
+        mode = self._resolve_scoring_mode(scoring_mode)
+
+        logits = self._compose_eval_logits(
+            z_test,
+            t_protos,
+            scale=scale,
+            baseline_t_protos=baseline_t_protos,
+        )
+        logits = self._blend_with_cache_logits(
+            logits,
+            z_test,
+            dataset_name,
+            use_cache=bool(use_cache),
+            calib_T=calib_T,
+            scoring_mode=mode,
+        )
+
+        stats = {
+            "Macro-AUC": np.nan,
+            "Micro-AUC": np.nan,
+            "ECE": np.nan,
+            "Acc": 0.0,
+            "Top1_Median": 0.0,
+            "Brier": np.nan,
+            "Temperature": calib_T,
+        }
+
+        if is_multi:
+            probs = self._predict_probs(
+                logits, calib_T=calib_T, is_multi=True, dataset_name=dataset_name, scoring_mode=mode, ranking=False
+            ).cpu().numpy()
+            stats["Top1_Median"] = np.median(probs.max(axis=1))
+
+            try:
+                if y_test.ndim != 2:
+                    raise ValueError(f"Expected multilabel y_test as 2D array, got shape={getattr(y_test, 'shape', None)}")
+                n_labels = int(y_test.shape[1])
+                n_proto = int(probs.shape[1])
+                n_eval = max(1, min(n_labels, n_proto))
+
+                # Assume label columns align with ORDERED_CLASS_NAMES[:n_eval]
+                eval_indices = list(range(n_eval))
+                probs_eval = probs[:, eval_indices]
+                y_eval = y_test[:, eval_indices]
+
+                aucs = [roc_auc_score(y_eval[:, i], probs_eval[:, i])
+                        for i in range(n_eval) if len(np.unique(y_eval[:, i])) > 1]
+                if aucs:
+                    stats["Macro-AUC"] = np.mean(aucs)
+                try:
+                    stats["Micro-AUC"] = roc_auc_score(y_eval, probs_eval, average="micro")
+                except Exception:
+                    pass
+
+                stats["ECE"] = self._compute_ece(y_eval, probs_eval)
+                stats["Acc"] = f1_score(y_eval, (probs_eval > 0.5).astype(int), average="macro", zero_division=0)
+                stats["Brier"] = float(np.mean((probs_eval - y_eval) ** 2))
+
+                if "DEBUG_AUC_CHECK" in os.environ:
+                    probs_T1 = self._predict_probs(
+                        logits, calib_T=1.0, is_multi=True, dataset_name=dataset_name, scoring_mode=mode, ranking=True
+                    ).cpu().numpy()
+                    try:
+                        probs_T1 = probs_T1[:, eval_indices]
+                        aucs_T1 = [roc_auc_score(y_eval[:, i], probs_T1[:, i])
+                                   for i in range(n_eval) if len(np.unique(y_eval[:, i])) > 1]
+                        if aucs_T1 and not np.isnan(stats["Macro-AUC"]):
+                            assert abs(np.mean(aucs_T1) - stats["Macro-AUC"]) < 2e-3, "AUC changed unexpectedly after calibration!"
+                    except Exception:
+                        pass
+            except Exception as e:
+                self._log(f"Metric Error: {e}")
+
+        else:
+            probs_calib_full = F.softmax(logits / calib_T, dim=1).cpu().numpy()
+            stats["Top1_Median"] = np.median(probs_calib_full.max(axis=1))
+
+            prob_pos_calibrated = self._predict_probs(
+                logits, calib_T=calib_T, is_multi=False, dataset_name=dataset_name, scoring_mode=mode, ranking=False
+            ).cpu().numpy()
+            prob_pos_ranking = self._predict_probs(
+                logits, calib_T=1.0, is_multi=False, dataset_name=dataset_name, scoring_mode=mode, ranking=True
+            ).cpu().numpy()
+
+            stats["ECE"] = self._compute_ece(y_test, prob_pos_calibrated)
+            stats["Acc"] = accuracy_score(y_test, (prob_pos_calibrated > 0.5).astype(int))
+            stats["Brier"] = float(np.mean((prob_pos_calibrated - y_test) ** 2))
+            try:
+                if len(np.unique(y_test)) > 1:
+                    auc_val = roc_auc_score(y_test, prob_pos_ranking)
+                    stats["Macro-AUC"] = auc_val
+                    stats["Micro-AUC"] = auc_val
+            except Exception:
+                pass
+
+        return stats
+
+    def _fit_posthoc_tau(
+        self,
+        logits_np: np.ndarray,
+        labels_np: np.ndarray,
+        dataset_name: str,
+        is_multi: bool,
+        scoring_mode: Optional[str] = None,
+    ):
+        """Post-hoc probability calibration: search tau in [0.5, 2.0] with coarse grid + local refine."""
+        mode = self._resolve_scoring_mode(scoring_mode)
+        logits_arr = np.asarray(logits_np, dtype=np.float64)
+        labels_arr = np.asarray(labels_np)
+        if logits_arr.ndim != 2:
+            raise ValueError(f"logits_np must be 2D [N, C], got shape={logits_arr.shape}")
+
+        if is_multi:
+            if labels_arr.ndim != 2:
+                raise ValueError(f"Multilabel calibration labels must be 2D, got shape={labels_arr.shape}")
+            n_use = max(1, min(labels_arr.shape[1], logits_arr.shape[1]))
+            y_cal = labels_arr[:, :n_use].astype(np.float64)
+        else:
+            pos_indices = self._get_binary_positive_indices(dataset_name, logits_arr.shape[1])
+            if labels_arr.ndim == 2:
+                max_idx = max(pos_indices)
+                if max_idx < labels_arr.shape[1]:
+                    y_bin = labels_arr[:, pos_indices].max(axis=1)
+                else:
+                    y_bin = labels_arr[:, 0]
+            else:
+                y_bin = labels_arr.reshape(-1)
+            y_cal = y_bin.reshape(-1, 1).astype(np.float64)
+
+        eps = 1e-8
+
+        def nll_tau(tau_val: float) -> float:
+            tau = float(np.clip(tau_val, 0.5, 2.0))
+            scaled = logits_arr / tau
+
+            if mode == "mixed":
+                if is_multi:
+                    probs = 1.0 / (1.0 + np.exp(-scaled[:, : y_cal.shape[1]]))
+                else:
+                    pos_indices_local = self._get_binary_positive_indices(dataset_name, scaled.shape[1])
+                    neg_indices_local = [i for i in range(scaled.shape[1]) if i not in pos_indices_local]
+                    if len(neg_indices_local) == 0:
+                        bin_logit = scaled[:, pos_indices_local].mean(axis=1, keepdims=True)
+                    else:
+                        pos_term = logsumexp(scaled[:, pos_indices_local], axis=1, keepdims=True)
+                        neg_term = logsumexp(scaled[:, neg_indices_local], axis=1, keepdims=True)
+                        bin_logit = pos_term - neg_term
+                    probs = 1.0 / (1.0 + np.exp(-bin_logit))
+            else:
+                probs_full = np.exp(scaled - logsumexp(scaled, axis=1, keepdims=True))
+                if is_multi:
+                    probs = probs_full[:, : y_cal.shape[1]]
+                else:
+                    pos_indices_local = self._get_binary_positive_indices(dataset_name, scaled.shape[1])
+                    probs = probs_full[:, pos_indices_local].sum(axis=1, keepdims=True)
+
+            probs = np.clip(probs, eps, 1.0 - eps)
+            loss = -(y_cal * np.log(probs) + (1.0 - y_cal) * np.log(1.0 - probs)).mean()
+            return float(loss)
+
+        grid = [0.5, 0.6, 0.75, 1.0, 1.25, 1.5, 2.0]
+        grid_vals = [(g, nll_tau(g)) for g in grid]
+        best_tau, best_nll = min(grid_vals, key=lambda x: x[1])
+
+        # local refinement within 卤20% of best grid point
+        lo, hi = best_tau * 0.8, best_tau * 1.2
+        lo, hi = max(0.5, lo), min(2.0, hi)
+        tol_improve = 0.001  # 0.1% improvement threshold
+        for _ in range(6):
+            mid = 0.5 * (lo + hi)
+            nll_mid = nll_tau(mid)
+            if nll_mid < best_nll * (1 - tol_improve):
+                best_tau, best_nll = mid, nll_mid
+            # choose interval that improves
+            nll_lo, nll_hi = nll_tau(lo), nll_tau(hi)
+            if nll_lo < nll_hi:
+                hi = mid
+            else:
+                lo = mid
+        return best_tau, best_nll
+
+    def _get_gate_active_mask(self, n_cls: int) -> torch.Tensor:
+        return self._get_alignment_active_mask(n_cls=n_cls)
+
+    def _compute_dataset_label_centroids(
+        self,
+        z_embed: torch.Tensor,
+        y_labels,
+        n_cls: int,
+        dataset_name: Optional[str],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Recompute per-dataset image centroids from dataset labels in the same aligned space.
+        Returns:
+            mu_dataset: [C, D] normalized where support>0
+            support:    [C] per-class positive counts used to build centroids
+        """
+        z_norm = self._l2_norm(z_embed)
+        n_samples, d = z_norm.shape
+        mu = torch.zeros((n_cls, d), device=self.device, dtype=z_norm.dtype)
+        support = torch.zeros(n_cls, device=self.device, dtype=z_norm.dtype)
+
+        y_arr = np.asarray(y_labels)
+        if y_arr.ndim == 2:
+            n_use = max(1, min(n_cls, y_arr.shape[1]))
+            y_bin = (y_arr[:, :n_use] > 0).astype(np.float32)
+            y_t = torch.tensor(y_bin, device=self.device, dtype=z_norm.dtype)
+            if y_t.shape[0] != n_samples:
+                n_trim = min(int(y_t.shape[0]), int(n_samples))
+                y_t = y_t[:n_trim]
+                z_norm = z_norm[:n_trim]
+                n_samples = n_trim
+            s = y_t.sum(dim=0)
+            support[:n_use] = s
+            if n_samples > 0:
+                mu_part = torch.matmul(y_t.T, z_norm) / s.view(-1, 1).clamp_min(1e-6)
+                valid = s > 0
+                if bool(valid.any().item()):
+                    mu[:n_use][valid] = self._l2_norm(mu_part[valid])
+            return mu, support
+
+        y_bin_np = (y_arr.reshape(-1) > 0).astype(np.float32)
+        y_t = torch.tensor(y_bin_np, device=self.device, dtype=z_norm.dtype).view(-1, 1)
+        if y_t.shape[0] != n_samples:
+            n_trim = min(int(y_t.shape[0]), int(n_samples))
+            y_t = y_t[:n_trim]
+            z_norm = z_norm[:n_trim]
+        pos_indices = self._get_binary_positive_indices(dataset_name, n_cls)
+        pos_count = float(y_t.sum().item())
+        if len(pos_indices) > 0 and pos_count > 0:
+            mu_pos = (torch.matmul(y_t.T, z_norm) / max(pos_count, 1e-6)).view(-1)
+            mu_pos = self._l2_norm(mu_pos.view(1, -1)).view(-1)
+            for idx in pos_indices:
+                mu[idx] = mu_pos
+                support[idx] = pos_count
+        return mu, support
+
+    def _compute_alignment_stats_from_mu(
+        self,
+        mu: torch.Tensor,
+        mask: torch.Tensor,
+        t_base: torch.Tensor,
+        t_rot: torch.Tensor,
+    ) -> Dict[str, float]:
+        t_base_norm = self._l2_norm(t_base)
+        t_rot_norm = self._l2_norm(t_rot)
+
+        n_cls = min(mu.shape[0], t_base_norm.shape[0], t_rot_norm.shape[0], mask.shape[0])
+        if n_cls <= 0:
+            return {
+                "sim_before": 0.0,
+                "sim_after": 0.0,
+                "sim_gain": 0.0,
+                "off_diag_pre": 0.0,
+                "off_diag_post_mean": 0.0,
+                "off_diag_post_max": 0.0,
+                "active_classes": 0,
+            }
+
+        mu = self._l2_norm(mu[:n_cls])
+        t_base_norm = t_base_norm[:n_cls]
+        t_rot_norm = t_rot_norm[:n_cls]
+        mask = mask[:n_cls].bool()
+
+        n_active = int(mask.sum().item())
+        if n_active <= 0:
+            return {
+                "sim_before": 0.0,
+                "sim_after": 0.0,
+                "sim_gain": 0.0,
+                "off_diag_pre": 0.0,
+                "off_diag_post_mean": 0.0,
+                "off_diag_post_max": 0.0,
+                "active_classes": 0,
+            }
+
+        sim_pre_full = torch.matmul(mu, t_base_norm.T)
+        sim_post_full = torch.matmul(mu, t_rot_norm.T)
+        sim_pre = sim_pre_full.diag()
+        sim_post = sim_post_full.diag()
+        sim_before = sim_pre[mask].mean()
+        sim_after = sim_post[mask].mean()
+        sim_gain = sim_after - sim_before
+
+        idx = torch.where(mask)[0]
+        n_act = int(idx.numel())
+        if n_act <= 1:
+            off_diag_pre = torch.tensor([0.0], device=self.device)
+            off_diag_post = torch.tensor([0.0], device=self.device)
+        else:
+            sim_pre_act = sim_pre_full.index_select(0, idx).index_select(1, idx)
+            sim_post_act = sim_post_full.index_select(0, idx).index_select(1, idx)
+            off_mask = ~torch.eye(n_act, dtype=torch.bool, device=self.device)
+            off_diag_pre = sim_pre_act[off_mask]
+            off_diag_post = sim_post_act[off_mask]
+
+        return {
+            "sim_before": float(sim_before.item()),
+            "sim_after": float(sim_after.item()),
+            "sim_gain": float(sim_gain.item()),
+            "off_diag_pre": float(off_diag_pre.mean().item()),
+            "off_diag_post_mean": float(off_diag_post.mean().item()),
+            "off_diag_post_max": float(off_diag_post.max().item()),
+            "active_classes": int(n_active),
+        }
+
+    def _compute_dataset_alignment_stats(
+        self,
+        z_embed: Optional[torch.Tensor],
+        y_labels,
+        t_base: torch.Tensor,
+        t_rot: torch.Tensor,
+        dataset_name: Optional[str] = None,
+        sim_source: Optional[str] = None,
+    ):
+        """
+        Unified Sim formula:
+            Sim = mean_{c in C_tau} <mu_c, t_c>
+        where only mu_c source changes:
+            - gate:    mu_c from Procrustes/Gate centroids (alignment state)
+            - dataset: mu_c recomputed on target dataset labels, with C_tau intersection
+        """
+        src = self._resolve_sim_source(sim_source)
+        if self.image_centroids is None:
+            raise RuntimeError("image_centroids is missing; run pipeline first.")
+
+        n_cls = min(self.image_centroids.shape[0], t_base.shape[0], t_rot.shape[0])
+        gate_mask = self._get_gate_active_mask(n_cls)
+
+        if src == "gate":
+            mu_gate = self._l2_norm(self.image_centroids[:n_cls])
+            out = self._compute_alignment_stats_from_mu(mu_gate, gate_mask, t_base[:n_cls], t_rot[:n_cls])
+            out["sim_source"] = "gate"
+            out["sim_scope"] = "C_tau"
+            return out
+
+        if z_embed is None or y_labels is None:
+            raise ValueError("dataset sim source requires z_embed and y_labels.")
+        mu_dataset, support = self._compute_dataset_label_centroids(z_embed, y_labels, n_cls, dataset_name)
+        data_mask = support > 0
+        mask = gate_mask & data_mask
+        out = self._compute_alignment_stats_from_mu(mu_dataset, mask, t_base[:n_cls], t_rot[:n_cls])
+        out["sim_source"] = "dataset"
+        out["sim_scope"] = "C_tau_intersect_dataset"
+        out["dataset_supported_classes"] = int(data_mask.sum().item())
+        return out
+
+    def _prepare_auc_inputs(
+        self,
+        y_test,
+        logits: torch.Tensor,
+        is_multi: bool,
+        dataset_name: str,
+        scoring_mode: Optional[str] = None,
+    ):
+        logits = logits.detach()
+        mode = self._resolve_scoring_mode(scoring_mode)
+        if is_multi:
+            y_arr = np.asarray(y_test)
+            probs = self._predict_probs(
+                logits, calib_T=1.0, is_multi=True, dataset_name=dataset_name, scoring_mode=mode, ranking=True
+            ).cpu().numpy()
+            if y_arr.ndim != 2:
+                return None
+            n_use = max(1, min(y_arr.shape[1], probs.shape[1]))
+            return {
+                "is_multi": True,
+                "y": y_arr[:, :n_use].astype(np.int32),
+                "s": probs[:, :n_use].astype(np.float64),
+            }
+
+        score = self._predict_probs(
+            logits, calib_T=1.0, is_multi=False, dataset_name=dataset_name, scoring_mode=mode, ranking=True
+        ).detach().cpu().numpy().reshape(-1).astype(np.float64)
+
+        y_arr = np.asarray(y_test)
+        if y_arr.ndim == 2:
+            pos_indices = self._get_binary_positive_indices(dataset_name, logits.shape[1])
+            max_idx = max(pos_indices)
+            if max_idx < y_arr.shape[1]:
+                y_bin = y_arr[:, pos_indices].max(axis=1)
+            else:
+                y_bin = y_arr[:, 0]
+        else:
+            y_bin = y_arr.reshape(-1)
+        y_bin = y_bin.astype(np.int32)
+
+        n_use = min(len(y_bin), len(score))
+        return {"is_multi": False, "y": y_bin[:n_use], "s": score[:n_use]}
+
+    def _macro_auc_from_inputs(self, packed: Optional[Dict[str, object]]) -> float:
+        if packed is None:
+            return np.nan
+        is_multi = bool(packed.get("is_multi", False))
+        y = packed.get("y", None)
+        s = packed.get("s", None)
+        if y is None or s is None:
+            return np.nan
+        y_arr = np.asarray(y)
+        s_arr = np.asarray(s)
+
+        if is_multi:
+            if y_arr.ndim != 2 or s_arr.ndim != 2:
+                return np.nan
+            n_use = min(y_arr.shape[1], s_arr.shape[1])
+            vals = []
+            for c in range(n_use):
+                yc = y_arr[:, c]
+                sc = s_arr[:, c]
+                if len(np.unique(yc)) < 2:
+                    continue
+                try:
+                    vals.append(float(roc_auc_score(yc, sc)))
+                except Exception:
+                    continue
+            return float(np.mean(vals)) if vals else np.nan
+
+        y_bin = y_arr.reshape(-1)
+        s_bin = s_arr.reshape(-1)
+        if len(np.unique(y_bin)) < 2:
+            return np.nan
+        try:
+            return float(roc_auc_score(y_bin, s_bin))
+        except Exception:
+            return np.nan
+
+    def _paired_bootstrap_auc_delta(
+        self,
+        base_packed: Dict[str, object],
+        capa_packed: Dict[str, object],
+        n_boot: Optional[int] = None,
+    ) -> Dict[str, float]:
+        n_boot = int(self.config.AUC_BOOTSTRAP_ROUNDS if n_boot is None else n_boot)
+        n_boot = max(200, n_boot)
+        is_multi = bool(base_packed.get("is_multi", False))
+        if is_multi != bool(capa_packed.get("is_multi", False)):
+            return {"delta": np.nan, "ci_low": np.nan, "ci_high": np.nan}
+
+        y = np.asarray(base_packed["y"])
+        s0 = np.asarray(base_packed["s"])
+        s1 = np.asarray(capa_packed["s"])
+        n = int(min(len(y), len(s0), len(s1)))
+        if n <= 1:
+            return {"delta": np.nan, "ci_low": np.nan, "ci_high": np.nan}
+
+        y = y[:n]
+        s0 = s0[:n]
+        s1 = s1[:n]
+
+        if is_multi:
+            if y.ndim != 2 or s0.ndim != 2 or s1.ndim != 2:
+                return {"delta": np.nan, "ci_low": np.nan, "ci_high": np.nan}
+            n_use = min(y.shape[1], s0.shape[1], s1.shape[1])
+            valid_cols = [c for c in range(n_use) if len(np.unique(y[:, c])) >= 2]
+            if len(valid_cols) == 0:
+                return {"delta": np.nan, "ci_low": np.nan, "ci_high": np.nan}
+
+            def _macro_auc_fixed(yb: np.ndarray, sb: np.ndarray) -> float:
+                vals = []
+                for c in valid_cols:
+                    yc = yb[:, c]
+                    if len(np.unique(yc)) < 2:
+                        return np.nan
+                    vals.append(float(roc_auc_score(yc, sb[:, c])))
+                return float(np.mean(vals)) if vals else np.nan
+
+            delta_obs = _macro_auc_fixed(y, s1) - _macro_auc_fixed(y, s0)
+        else:
+            packed0 = {"is_multi": False, "y": y, "s": s0}
+            packed1 = {"is_multi": False, "y": y, "s": s1}
+            delta_obs = self._macro_auc_from_inputs(packed1) - self._macro_auc_from_inputs(packed0)
+        if not np.isfinite(delta_obs):
+            return {"delta": np.nan, "ci_low": np.nan, "ci_high": np.nan}
+
+        rng = np.random.default_rng(int(self.config.RANDOM_SEED))
+        deltas = []
+        for _ in range(n_boot):
+            idx = rng.integers(0, n, size=n, endpoint=False)
+            if is_multi:
+                d = _macro_auc_fixed(y[idx], s1[idx]) - _macro_auc_fixed(y[idx], s0[idx])
+            else:
+                p0 = {"is_multi": False, "y": y[idx], "s": s0[idx]}
+                p1 = {"is_multi": False, "y": y[idx], "s": s1[idx]}
+                d = self._macro_auc_from_inputs(p1) - self._macro_auc_from_inputs(p0)
+            if np.isfinite(d):
+                deltas.append(float(d))
+
+        if len(deltas) < 20:
+            return {"delta": float(delta_obs), "ci_low": np.nan, "ci_high": np.nan}
+
+        arr = np.asarray(deltas, dtype=np.float64)
+        return {
+            "delta": float(delta_obs),
+            "ci_low": float(np.quantile(arr, 0.025)),
+            "ci_high": float(np.quantile(arr, 0.975)),
+        }
+
+    def _compute_midrank(self, x: np.ndarray) -> np.ndarray:
+        order = np.argsort(x)
+        sorted_x = x[order]
+        n = len(x)
+        ranks = np.zeros(n, dtype=np.float64)
+        i = 0
+        while i < n:
+            j = i
+            while j < n and sorted_x[j] == sorted_x[i]:
+                j += 1
+            mid = 0.5 * (i + j - 1)
+            ranks[i:j] = mid + 1.0
+            i = j
+        out = np.empty(n, dtype=np.float64)
+        out[order] = ranks
+        return out
+
+    def _fast_delong(self, preds: np.ndarray, m: int):
+        n_classifiers, n_examples = preds.shape
+        n = n_examples - m
+        if m < 2 or n < 2:
+            return np.full((n_classifiers,), np.nan, dtype=np.float64), np.full((n_classifiers, n_classifiers), np.nan, dtype=np.float64)
+        pos = preds[:, :m]
+        neg = preds[:, m:]
+
+        tx = np.empty((n_classifiers, m), dtype=np.float64)
+        ty = np.empty((n_classifiers, n), dtype=np.float64)
+        tz = np.empty((n_classifiers, n_examples), dtype=np.float64)
+        for r in range(n_classifiers):
+            tx[r] = self._compute_midrank(pos[r])
+            ty[r] = self._compute_midrank(neg[r])
+            tz[r] = self._compute_midrank(preds[r])
+
+        aucs = tz[:, :m].sum(axis=1) / (m * n) - (m + 1.0) / (2.0 * n)
+        v01 = (tz[:, :m] - tx) / n
+        v10 = 1.0 - (tz[:, m:] - ty) / m
+        sx = np.cov(v01)
+        sy = np.cov(v10)
+        cov = sx / m + sy / n
+        return aucs, cov
+
+    def _delong_binary_delta_var(self, y_true: np.ndarray, s_base: np.ndarray, s_capa: np.ndarray):
+        y = np.asarray(y_true).reshape(-1).astype(np.int32)
+        s0 = np.asarray(s_base).reshape(-1).astype(np.float64)
+        s1 = np.asarray(s_capa).reshape(-1).astype(np.float64)
+        n = int(min(len(y), len(s0), len(s1)))
+        if n <= 1:
+            return np.nan, np.nan
+        y = y[:n]
+        s0 = s0[:n]
+        s1 = s1[:n]
+        if len(np.unique(y)) < 2:
+            return np.nan, np.nan
+
+        order = np.argsort(-y)
+        y_ord = y[order]
+        m = int(np.sum(y_ord == 1))
+        n_neg = int(len(y_ord) - m)
+        if m <= 0 or m >= len(y_ord) or m < 2 or n_neg < 2:
+            return np.nan, np.nan
+        preds = np.vstack([s0[order], s1[order]])
+        aucs, cov = self._fast_delong(preds, m)
+        delta = float(aucs[1] - aucs[0])
+        var = float(cov[0, 0] + cov[1, 1] - 2.0 * cov[0, 1])
+        if not np.isfinite(var) or var < 0.0:
+            var = np.nan
+        return delta, var
+
+    def _delong_macro_pvalue(self, base_packed: Dict[str, object], capa_packed: Dict[str, object]) -> float:
+        is_multi = bool(base_packed.get("is_multi", False))
+        if is_multi != bool(capa_packed.get("is_multi", False)):
+            return np.nan
+
+        if not is_multi:
+            d, v = self._delong_binary_delta_var(base_packed["y"], base_packed["s"], capa_packed["s"])
+            if not np.isfinite(d) or not np.isfinite(v) or v <= 0:
+                return np.nan
+            z = float(d / np.sqrt(v))
+            return float(2.0 * norm.sf(abs(z)))
+
+        y = np.asarray(base_packed["y"])
+        s0 = np.asarray(base_packed["s"])
+        s1 = np.asarray(capa_packed["s"])
+        if y.ndim != 2 or s0.ndim != 2 or s1.ndim != 2:
+            return np.nan
+        n_use = min(y.shape[1], s0.shape[1], s1.shape[1])
+        deltas = []
+        vars_ = []
+        for c in range(n_use):
+            d, v = self._delong_binary_delta_var(y[:, c], s0[:, c], s1[:, c])
+            if np.isfinite(d) and np.isfinite(v) and v > 0:
+                deltas.append(float(d))
+                vars_.append(float(v))
+        if len(deltas) == 0:
+            return np.nan
+        delta_macro = float(np.mean(deltas))
+        var_macro = float(np.sum(vars_) / (len(vars_) ** 2))
+        if not np.isfinite(var_macro) or var_macro <= 0:
+            return np.nan
+        z = float(delta_macro / np.sqrt(var_macro))
+        return float(2.0 * norm.sf(abs(z)))
+
+    def _plot_and_save_curves(self, y_true, y_prob, dataset_name, suffix="", is_multilabel=False, auc_override=None):
+        """Plot calibration and ROC curves and save to disk."""
+        prob_flat = y_prob.flatten()
+        true_flat = y_true.flatten()
+        fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+        try:
+            frac_pos, mean_pred = calibration_curve(true_flat, prob_flat, n_bins=10, strategy='quantile')
+            axes[0].plot(mean_pred, frac_pos, "s-", label=f"{dataset_name}")
+            axes[0].plot([0, 1], [0, 1], "k--", label="Perfectly Calibrated")
+            axes[0].set_xlabel("Mean Predicted Value")
+            axes[0].set_ylabel("Fraction of Positives")
+            axes[0].set_title(f"Calibration Curve ({dataset_name})")
+            axes[0].legend()
+        except ValueError:
+            axes[0].set_title("Calibration Curve unavailable")
+
+        # Use macro ROC for multilabel to match macro AUC metrics
+        if is_multilabel and y_prob.ndim == 2 and y_prob.shape[1] > 1:
+            fpr_grid = np.linspace(0, 1, 101)
+            tpr_list = []
+            for c in range(y_prob.shape[1]):
+                # Skip degenerate columns to avoid nan AUC
+                if len(np.unique(y_true[:, c])) < 2:
+                    continue
+                fpr_c, tpr_c, _ = roc_curve(y_true[:, c], y_prob[:, c])
+                tpr_interp = np.interp(fpr_grid, fpr_c, tpr_c)
+                tpr_list.append(tpr_interp)
+
+            if tpr_list:
+                mean_tpr = np.mean(tpr_list, axis=0)
+                roc_auc = auc(fpr_grid, mean_tpr)
+                axes[1].plot(fpr_grid, mean_tpr, label=f"Macro AUC = {roc_auc:.4f}")
+            else:
+                roc_auc = auc( *roc_curve(true_flat, prob_flat)[:2] ) if auc_override is None else auc_override
+                axes[1].plot(*roc_curve(true_flat, prob_flat)[:2], label=f"AUC = {roc_auc:.4f}")
+        else:
+            fpr, tpr, _ = roc_curve(true_flat, prob_flat)
+            roc_auc = auc_override if auc_override is not None else auc(fpr, tpr)
+            axes[1].plot(fpr, tpr, label=f"AUC = {roc_auc:.4f}")
+        axes[1].plot([0, 1], [0, 1], "k--")
+        axes[1].set_xlabel("False Positive Rate")
+        axes[1].set_ylabel("True Positive Rate")
+        axes[1].set_title(f"ROC Curve ({dataset_name})")
+        axes[1].legend()
+
+        save_path = os.path.join(self.config.SAVE_DIR, f"{dataset_name}_curves_{suffix}.png")
+        plt.tight_layout()
+        plt.savefig(save_path)
+        plt.close()
+        self._log(f"   -> Curves saved to {save_path}")
+
+    def _run_scale_sweep(self, s_values: List[float]):
+        """Sweep over scale factors without touching routing/temperature/rotation."""
+        self._log("\n[Stage IV-B] Scale Sweep (s)")
+        results = []
+        t_base = self.t_raw_pooled
+        t_align_base = self._get_alignment_text_base()
+        t_capa = self._l2_norm(torch.matmul(t_align_base, self.R_frozen.T))
+
+        for name, path in self.config.TEST_DATA_PATHS.items():
+            if not os.path.exists(path):
+                continue
+            z_test, y_test, is_multi = self._load_data(path, split_override=2)
+            if y_test is None:
+                continue
+
+            z_test = self._apply_preprocessing(z_test, self.zI_mean)
+
+            for s_val in s_values:
+                stats = self._compute_metrics(
+                    z_test,
+                    y_test,
+                    is_multi,
+                    t_capa,
+                    scale_override=s_val,
+                    dataset_name=name,
+                    baseline_t_protos=t_base,
+                )
+                results.append({
+                    "dataset": name,
+                    "s": s_val,
+                    "MacroAUC": stats["Macro-AUC"],
+                    "MicroAUC": stats["Micro-AUC"],
+                    "ECE": stats["ECE"],
+                    "Top1_Median": stats["Top1_Median"]
+                })
+
+                auc_val = stats["Macro-AUC"]
+                ece_val = stats["ECE"]
+                top1_med = stats["Top1_Median"]
+                self._log(f" {name:<10} | s={s_val:<3} | MacroAUC={auc_val:.4f} | ECE%={ece_val:.2f} | Top1Med={top1_med:.4f}")
+
+        if results:
+            df = pd.DataFrame(results)
+            out_path = os.path.join(self.config.SAVE_DIR, "scale_sweep_results.csv")
+            df.to_csv(out_path, index=False)
+            self._log(f"[Saved] {out_path}")
+        else:
+            self._log(" No datasets found for sweep; nothing saved.")
+
+    def run_manuscript_validation(self, scoring_mode: Optional[str] = None, sim_source: Optional[str] = None):
+        mode = self._resolve_scoring_mode(scoring_mode)
+        sim_src = self._resolve_sim_source(sim_source)
+        self._log(f"[Final] Manuscript Validation (scoring={mode}, sim={sim_src})")
+
+        state_path = os.path.join(self.config.SAVE_DIR, "capa_state.pkl")
+        if not os.path.exists(state_path):
+            raise FileNotFoundError(f"Missing state: {state_path}")
+
+        with open(state_path, "rb") as f:
+            state = pickle.load(f)
+
+        self.R_frozen = state["R"].to(self.device)
+        r_last_good = state.get("R_last_good", None)
+        if isinstance(r_last_good, torch.Tensor):
+            self.R_last_good = r_last_good.to(self.device)
+        else:
+            self.R_last_good = self.R_frozen.clone()
+        centroids_last_good = state.get("centroids_last_good", None)
+        self.centroids_last_good = centroids_last_good.to(self.device) if isinstance(centroids_last_good, torch.Tensor) else None
+        counts_blob = state.get("support_counts", state.get("counts"))
+        counts = counts_blob.to(self.device)
+        self.support_counts = counts.clone()
+        counts_lq = state.get("rejected_counts", state.get("counts_lq", None))
+        self.rejected_counts = counts_lq.to(self.device) if isinstance(counts_lq, torch.Tensor) else None
+        prior_counts = state.get("prior_counts", None)
+        self.prior_counts = prior_counts.to(self.device) if isinstance(prior_counts, torch.Tensor) else counts.clone()
+        if "centroids" in state and state["centroids"] is not None:
+            self.image_centroids = self._l2_norm(state["centroids"].to(self.device))
+        t_align_state = state.get("t_align_base", None)
+        if isinstance(t_align_state, torch.Tensor):
+            t_align_state = t_align_state.to(self.device)
+            if self.t_raw_pooled is not None and tuple(t_align_state.shape) == tuple(self.t_raw_pooled.shape):
+                self.t_align_base = self._l2_norm(t_align_state)
+            else:
+                self.t_align_base = None
+        else:
+            self.t_align_base = None
+        self.final_alignment_stats = state.get("alignment_stats", {})
+        self.max_leverage_info = state.get("max_leverage", "N/A")
+        guardian_state = state.get("guardian", {}) or {}
+        self.guardian_status = str(guardian_state.get("status", "normal"))
+        self.guardian_last_alarm_step = int(guardian_state.get("last_alarm_step", -1))
+        self.guardian_num_alarms = int(guardian_state.get("num_alarms", 0))
+        self.guardian_last_psi = float(guardian_state.get("last_psi", np.nan))
+        self.guardian_psi_history = [float(x) for x in list(guardian_state.get("psi_history", []))]
+        self.guardian_psi_baseline_hist = guardian_state.get("psi_baseline_hist", None)
+        self.guardian_psi_bin_edges = guardian_state.get("psi_bin_edges", None)
+
+        if self.t_align_base is None:
+            self.t_align_base = self.t_raw_pooled.clone()
+
+        eval_scale = float(self.s_opt)
+        self._set_prior_bias_from_counts(self.prior_counts if self.prior_counts is not None else counts)
+
+        # Keep alignment-space (processed) heads for both metrics and Sim reporting.
+        t_base_proc = self.t_raw_pooled
+        t_align_base_proc = self._get_alignment_text_base()
+        t_capa_proc = self._l2_norm(torch.matmul(t_align_base_proc, self.R_frozen.T))
+        gate_sim = self._compute_dataset_alignment_stats(
+            z_embed=None,
+            y_labels=None,
+            t_base=t_align_base_proc,
+            t_rot=t_capa_proc,
+            sim_source="gate",
+        )
+        gate_delta_offdiag = float(gate_sim["off_diag_post_mean"] - gate_sim["off_diag_pre"])
+
+        # Load held-out calibration set for post-hoc temperature scaling (tau); must NOT come from test sets.
+        # Load held-out calibration set for post-hoc temperature scaling (tau); must NOT come from test sets.
+        z_tau_raw, y_tau, is_multi_tau = self._load_data(
+            self.config.TAU_CALIB_DATA_PATH,
+            is_calibration=True,
+            split_override=1,
+        )
+        if y_tau is None:
+            raise RuntimeError(f"TAU calibration set has no labels: {self.config.TAU_CALIB_DATA_PATH}")
+        z_tau_proc = self._apply_preprocessing(z_tau_raw, self.zI_mean)
+
+        # Deterministic shuffle for tau calibration set
+        g_cpu_tau = torch.Generator()
+        g_cpu_tau.manual_seed(self.config.RANDOM_SEED)
+        perm_tau = torch.randperm(len(z_tau_proc), generator=g_cpu_tau)
+        z_tau_proc = z_tau_proc[perm_tau]
+        if isinstance(y_tau, np.ndarray):
+            y_tau = y_tau[perm_tau.cpu().numpy()]
+
+        n_tau_total = len(z_tau_proc)
+        n_tau = max(1, int(self.config.TAU_CALIB_FRAC * n_tau_total))
+        if n_tau_total >= 2500:
+            n_tau = min(self.config.TAU_CALIB_MAX, max(self.config.TAU_CALIB_MIN, n_tau))
+        z_tau_proc = z_tau_proc[:n_tau]
+        y_tau = y_tau[:n_tau]
+
+        final_report_rows = []
+
+        for d_name, path in self.config.TEST_DATA_PATHS.items():
+            if not os.path.exists(path):
+                continue
+
+            self._log(f"\n >> Processing {d_name} ...")
+            # 1. Load RAW Data
+            z_test_raw, y_test, is_multi = self._load_data(path, split_override=2)
+            if y_test is None:
+                continue
+
+            # Create PROCESSED Data (Whitened/Centered) for Metrics
+            z_test_proc = self._apply_preprocessing(z_test_raw, self.zI_mean)
+
+            # Deterministic shuffle (reproducibility only)
+            g_cpu = torch.Generator()
+            g_cpu.manual_seed(self.config.RANDOM_SEED)
+            perm = torch.randperm(len(z_test_raw), generator=g_cpu)
+            z_test_raw = z_test_raw[perm]
+            z_test_proc = z_test_proc[perm]
+            y_test = y_test[perm.cpu().numpy()]
+
+            z_eval_proc = z_test_proc
+            y_eval = y_test
+
+            # Dataset-space geometry diagnostic (for reporting only).
+            dataset_sim_eval = self._compute_dataset_alignment_stats(
+                z_embed=z_eval_proc,
+                y_labels=y_eval,
+                t_base=t_align_base_proc,
+                t_rot=t_capa_proc,
+                dataset_name=d_name,
+                sim_source="dataset",
+            )
+            t_eval_proc = t_capa_proc
+            cache_on_eval = bool(self._is_cache_enabled())
+
+            # Fit tau on held-out calibration set (NOT test sets), using Stage-IV-aligned runtime scale/bias.
+            logits_tau = self._compose_eval_logits(
+                z_tau_proc,
+                t_eval_proc,
+                scale=eval_scale,
+                baseline_t_protos=t_base_proc,
+            ).cpu().numpy()
+            labels_tau = np.array(y_tau)
+            if is_multi:
+                if labels_tau.ndim != 2:
+                    raise RuntimeError(f"TAU calib labels expected 2D for multilabel, got shape={labels_tau.shape}")
+                n_eval = int(y_eval.shape[1]) if getattr(y_eval, "ndim", 1) == 2 else 1
+                n_tau_labels = int(labels_tau.shape[1])
+                n_tau_logits = int(logits_tau.shape[1])
+                n_use = max(1, min(n_eval, n_tau_labels, n_tau_logits))
+                logits_tau = logits_tau[:, :n_use]
+                labels_tau = labels_tau[:, :n_use]
+            tau_cal, _ = self._fit_posthoc_tau(
+                logits_tau,
+                labels_tau,
+                dataset_name=d_name,
+                is_multi=is_multi,
+                scoring_mode=mode,
+            )
+            assert hasattr(self, "T_opt") and self.T_opt == self.config.INIT_TEMPERATURE, "Routing T_opt was unexpectedly modified!"
+            np.save(os.path.join(self.config.SAVE_DIR, f"{d_name}_LOGITS_U_{mode}.npy"), logits_tau)
+            np.save(os.path.join(self.config.SAVE_DIR, f"{d_name}_LABELS_U_{mode}.npy"), labels_tau)
+
+            # Compute Metrics using PROCESSED data
+            stats_pre = self._compute_metrics(
+                z_eval_proc, y_eval, is_multi, t_eval_proc,
+                scale_override=eval_scale,
+                temperature_override=self.T_opt,
+                dataset_name=d_name,
+                scoring_mode=mode,
+                baseline_t_protos=t_base_proc,
+            )
+            stats_post = self._compute_metrics(
+                z_eval_proc, y_eval, is_multi, t_eval_proc,
+                scale_override=eval_scale,
+                temperature_override=tau_cal,
+                dataset_name=d_name,
+                scoring_mode=mode,
+                baseline_t_protos=t_base_proc,
+            )
+            stats_base = self._compute_metrics(
+                z_eval_proc, y_eval, is_multi, t_base_proc,
+                scale_override=eval_scale, temperature_override=self.T_opt, dataset_name=d_name, scoring_mode=mode
+            )
+            stats_capa = self._compute_metrics(
+                z_eval_proc, y_eval, is_multi, t_eval_proc,
+                scale_override=eval_scale,
+                temperature_override=self.T_opt,
+                dataset_name=d_name,
+                scoring_mode=mode,
+                baseline_t_protos=t_base_proc,
+            )
+            stats_capa_cache = self._compute_metrics(
+                z_eval_proc,
+                y_eval,
+                is_multi,
+                t_eval_proc,
+                scale_override=eval_scale,
+                temperature_override=self.T_opt,
+                dataset_name=d_name,
+                scoring_mode=mode,
+                use_cache=cache_on_eval,
+                baseline_t_protos=t_base_proc,
+            )
+            cache_info = dict(self.last_cache_eval_info)
+
+            auc_diff = abs(stats_post["Macro-AUC"] - stats_pre["Macro-AUC"])
+            if auc_diff > 1e-5:
+                self._log(f"[WARN] AUC mismatch! Pre: {stats_pre['Macro-AUC']:.5f}, Post: {stats_post['Macro-AUC']:.5f}")
+
+            delta_macro_auc = np.nan
+            if np.isfinite(stats_capa["Macro-AUC"]) and np.isfinite(stats_base["Macro-AUC"]):
+                delta_macro_auc = float(stats_capa["Macro-AUC"] - stats_base["Macro-AUC"])
+            delta_micro_auc = np.nan
+            if np.isfinite(stats_capa["Micro-AUC"]) and np.isfinite(stats_base["Micro-AUC"]):
+                delta_micro_auc = float(stats_capa["Micro-AUC"] - stats_base["Micro-AUC"])
+            delta_ece = np.nan
+            if np.isfinite(stats_capa["ECE"]) and np.isfinite(stats_base["ECE"]):
+                delta_ece = float(stats_capa["ECE"] - stats_base["ECE"])
+            delta_macro_auc_cache = np.nan
+            if np.isfinite(stats_capa_cache["Macro-AUC"]) and np.isfinite(stats_base["Macro-AUC"]):
+                delta_macro_auc_cache = float(stats_capa_cache["Macro-AUC"] - stats_base["Macro-AUC"])
+            delta_micro_auc_cache = np.nan
+            if np.isfinite(stats_capa_cache["Micro-AUC"]) and np.isfinite(stats_base["Micro-AUC"]):
+                delta_micro_auc_cache = float(stats_capa_cache["Micro-AUC"] - stats_base["Micro-AUC"])
+            delta_ece_cache = np.nan
+            if np.isfinite(stats_capa_cache["ECE"]) and np.isfinite(stats_base["ECE"]):
+                delta_ece_cache = float(stats_capa_cache["ECE"] - stats_base["ECE"])
+
+            logits_eval = self._compose_eval_logits(
+                z_eval_proc,
+                t_eval_proc,
+                scale=eval_scale,
+                baseline_t_protos=t_base_proc,
+            )
+            if sim_src == "gate":
+                dataset_sim = gate_sim
+            else:
+                dataset_sim = dataset_sim_eval
+            delta_offdiag = float(dataset_sim["off_diag_post_mean"] - dataset_sim["off_diag_pre"])
+
+            logits_base_eval = self._compose_eval_logits(
+                z_eval_proc,
+                t_base_proc,
+                scale=eval_scale,
+                baseline_t_protos=None,
+            )
+            logits_capa_eval = self._compose_eval_logits(
+                z_eval_proc,
+                t_eval_proc,
+                scale=eval_scale,
+                baseline_t_protos=t_base_proc,
+            )
+            auc_base_pack = self._prepare_auc_inputs(
+                y_eval, logits_base_eval, is_multi=is_multi, dataset_name=d_name, scoring_mode=mode
+            )
+            auc_capa_pack = self._prepare_auc_inputs(
+                y_eval, logits_capa_eval, is_multi=is_multi, dataset_name=d_name, scoring_mode=mode
+            )
+            ci = {"delta": np.nan, "ci_low": np.nan, "ci_high": np.nan}
+            p_val = np.nan
+            if auc_base_pack is not None and auc_capa_pack is not None:
+                ci = self._paired_bootstrap_auc_delta(auc_base_pack, auc_capa_pack)
+                p_val = self._delong_macro_pvalue(auc_base_pack, auc_capa_pack)
+            prob_plot = self._predict_probs(
+                logits_eval,
+                calib_T=tau_cal,
+                is_multi=is_multi,
+                dataset_name=d_name,
+                scoring_mode=mode,
+                ranking=False,
+            ).cpu().numpy()
+            y_plot = y_eval
+
+            self._plot_and_save_curves(
+                y_plot,
+                prob_plot,
+                d_name,
+                suffix=f"stage4_{mode}",
+                is_multilabel=is_multi,
+                auc_override=stats_post["Macro-AUC"],
+            )
+
+            row = {
+                "Line": "capav1_gt",
+                "Dataset": d_name,
+                "Param_Profile": self.config.PARAM_PROFILE,
+                "Label_Space": self.config.LABEL_SPACE,
+                "ScoringMode": mode,
+                "Calibrator": "Temp (Scalar)",
+                "Scale": eval_scale,
+                "Tau": tau_cal,
+                "Init_Temperature": float(self.config.INIT_TEMPERATURE),
+                "N_Min_Support": int(self.config.N_MIN_SUPPORT_FOR_ACTIVE),
+                "Min_Classes_Adapt": int(self.config.MIN_CLASSES_FOR_ADAPTATION),
+                "Cache_Mode": str(getattr(self.config, "CACHE_MODE", "off")),
+                "Cache_Alpha_Max": float(self.config.CACHE_ALPHA_MAX),
+                "Cache_TopK": int(self.config.CACHE_TOPK),
+                "Cache_Temp": float(self.config.CACHE_TEMP),
+                "Cache_Dataset_Gate": bool(cache_info.get("dataset_gate", False)),
+                "Cache_PSI_Top1": cache_info.get("psi_top1", np.nan),
+                "Cache_PSI_TopKMean": cache_info.get("psi_topk_mean", np.nan),
+                "Cache_PSI_Entropy": cache_info.get("psi_entropy", np.nan),
+                "Cache_Usage_Rate": cache_info.get("usage_rate", 0.0),
+                "Cache_Mean_Alpha": cache_info.get("mean_alpha", 0.0),
+                "Cache_Agree_Rate": cache_info.get("agree_rate", np.nan),
+                "Cache_Mean_Top1Sim": cache_info.get("mean_top1_sim", np.nan),
+                "Cache_Mean_Purity": cache_info.get("mean_purity", np.nan),
+                "Cache_Mean_Entropy": cache_info.get("mean_entropy", np.nan),
+                "AUC_Baseline_ZeroShot_Macro": stats_base["Macro-AUC"],
+                "AUC_CAPA_Aligned_Macro": stats_capa["Macro-AUC"],
+                "Delta_AUC_CAPA_minus_Baseline_Macro": delta_macro_auc,
+                "AUC_CAPA_Cache_Macro": stats_capa_cache["Macro-AUC"],
+                "Delta_AUC_CAPA_Cache_minus_Baseline_Macro": delta_macro_auc_cache,
+                "AUC_Baseline_ZeroShot_Micro": stats_base["Micro-AUC"],
+                "AUC_CAPA_Aligned_Micro": stats_capa["Micro-AUC"],
+                "Delta_AUC_CAPA_minus_Baseline_Micro": delta_micro_auc,
+                "AUC_CAPA_Cache_Micro": stats_capa_cache["Micro-AUC"],
+                "Delta_AUC_CAPA_Cache_minus_Baseline_Micro": delta_micro_auc_cache,
+                "AUC_Pre": stats_pre["Macro-AUC"],
+                "AUC_Post": stats_post["Macro-AUC"],
+                "ECE_Pre": stats_pre["ECE"],
+                "ECE_Post": stats_post["ECE"],
+                "ECE_CAPA_Cache": stats_capa_cache["ECE"],
+                "Brier": stats_post["Brier"],
+                "Sim_Source": str(dataset_sim.get("sim_source", sim_src)),
+                "Sim_Scope": str(dataset_sim.get("sim_scope", "")),
+                "Sim_Before": dataset_sim["sim_before"],
+                "Sim_After": dataset_sim["sim_after"],
+                "Sim_Gain": dataset_sim["sim_gain"],
+                "Delta_OffDiag": delta_offdiag,
+                "OffDiag_Pre": dataset_sim["off_diag_pre"],
+                "OffDiag_Post_Mean": dataset_sim["off_diag_post_mean"],
+                "OffDiag_Post_Max": dataset_sim["off_diag_post_max"],
+                "Active_Classes": dataset_sim["active_classes"],
+                "Dataset_Supported_Classes": dataset_sim.get("dataset_supported_classes", np.nan),
+                "Calib_Sim_Before": gate_sim["sim_before"],
+                "Calib_Sim_After": gate_sim["sim_after"],
+                "Calib_Sim_Gain": gate_sim["sim_gain"],
+                "Calib_Delta_OffDiag": gate_delta_offdiag,
+                "Calib_OffDiag_Pre": gate_sim["off_diag_pre"],
+                "Calib_OffDiag_Post_Mean": gate_sim["off_diag_post_mean"],
+                "Calib_OffDiag_Post_Max": gate_sim["off_diag_post_max"],
+                "Calib_Active_Classes": gate_sim["active_classes"],
+                "Delta_ECE": delta_ece,
+                "Delta_ECE_CAPA_Cache_minus_Baseline": delta_ece_cache,
+                "Delta_AUC_CI_Low": ci["ci_low"],
+                "Delta_AUC_CI_High": ci["ci_high"],
+                "Delta_AUC_DeLong_p": p_val,
+            }
+            final_report_rows.append(row)
+
+        df = pd.DataFrame(final_report_rows)
+        out_path = os.path.join(self.config.SAVE_DIR, f"final_manuscript_table_{mode}_{sim_src}.csv")
+        df.to_csv(out_path, index=False)
+        self._log(f"[Saved] {out_path}")
+        three_way_cols = [
+            "Dataset",
+            "AUC_Baseline_ZeroShot_Macro",
+            "AUC_CAPA_Aligned_Macro",
+            "AUC_CAPA_Cache_Macro",
+            "Delta_AUC_CAPA_minus_Baseline_Macro",
+            "Delta_AUC_CAPA_Cache_minus_Baseline_Macro",
+        ]
+        three_path = os.path.join(self.config.SAVE_DIR, f"four_dataset_three_way_{mode}_{sim_src}.csv")
+        df.loc[:, [c for c in three_way_cols if c in df.columns]].to_csv(three_path, index=False)
+        self._log(f"[Saved] {three_path}")
+        if mode == self._resolve_scoring_mode(None) and sim_src == self._resolve_sim_source(None):
+            legacy_out = os.path.join(self.config.SAVE_DIR, "final_manuscript_table.csv")
+            df.to_csv(legacy_out, index=False)
+            self._log(f"[Saved] {legacy_out}")
+            legacy_three = os.path.join(self.config.SAVE_DIR, "four_dataset_three_way.csv")
+            df.loc[:, [c for c in three_way_cols if c in df.columns]].to_csv(legacy_three, index=False)
+            self._log(f"[Saved] {legacy_three}")
+        return final_report_rows
+
+    # === 鏂板杈呭姪鍑芥暟锛歅SI 璁＄畻 ===
+    def _compute_psi(self, expected_array, actual_array, n_bins=10, eps=1e-6):
+        """Quantile-binned PSI to avoid artificial drift from shifted scales."""
+        breakpoints = np.linspace(0, 100, n_bins + 1)
+        bins = np.percentile(expected_array, breakpoints)
+        bins[0] = -0.01
+        bins[-1] = 1.01
+        for i in range(1, len(bins)):
+            if bins[i] <= bins[i-1]:
+                bins[i] = bins[i-1] + 1e-6
+
+        expected_hist, _ = np.histogram(expected_array, bins=bins)
+        actual_hist, _ = np.histogram(actual_array, bins=bins)
+        e_dist = expected_hist / (expected_hist.sum() + eps)
+        a_dist = actual_hist / (actual_hist.sum() + eps)
+        psi_vals = (a_dist - e_dist) * np.log((a_dist + eps) / (e_dist + eps))
+        return np.sum(psi_vals)
+
+    def run_psi_monitor_shadow_mode(self):
+        print("\n" + "="*60)
+        print(" Stage III: PSI Monitor (Final: Adaptive + Shuffled + Dynamic Bins)")
+        print("="*60)
+        
+        dataset_s_map = {"CheXpert": 8.0, "MIMIC": 8.0, "COVID": 40.0, "RSNA": 40.0}
+        prior_strength = 0.2
+        # Prior bias disabled for consistency (b_c=0 everywhere).
+        
+        # 鍔犺浇鍐荤粨鐘舵€?
+        state_path = os.path.join(self.config.SAVE_DIR, "capa_state.pkl")
+        if not os.path.exists(state_path):
+            print(" [Error] State file not found.")
+            return
+
+        with open(state_path, "rb") as f: state = pickle.load(f)
+        self.R_frozen = state["R"].to(self.device)
+        counts = state["counts"].to(self.device)
+        t_align_state = state.get("t_align_base", None)
+        if isinstance(t_align_state, torch.Tensor):
+            t_align_state = t_align_state.to(self.device)
+            if self.t_raw_pooled is not None and tuple(t_align_state.shape) == tuple(self.t_raw_pooled.shape):
+                self.t_align_base = self._l2_norm(t_align_state)
+            else:
+                self.t_align_base = None
+        else:
+            self.t_align_base = None
+        
+        total_counts = counts.sum()
+        priors = (counts + 1e-6) / (total_counts + 1e-6 * len(counts))
+        self.b_c = (prior_strength * torch.log(priors)).view(1, -1)
+        
+        t_align_base = self._get_alignment_text_base()
+        t_capa = self._l2_norm(torch.matmul(t_align_base, self.R_frozen.T))
+        
+        results = []
+
+        for name, path in self.config.TEST_DATA_PATHS.items():
+            if not os.path.exists(path): continue
+            
+            print(f"\n >> Monitoring {name} (Simulation)...")
+            z_test, _, _ = self._load_data(path, split_override=2)
+            z_test = self._apply_preprocessing(z_test, self.zI_mean)
+            
+            # 1. Shuffle
+            g_cpu = torch.Generator()
+            g_cpu.manual_seed(self.config.RANDOM_SEED)
+            perm_indices = torch.randperm(len(z_test), generator=g_cpu)
+            z_test = z_test[perm_indices]
+            
+            # 2. Dynamic Config (鍏抽敭淇敼: 閽堝灏忔暟鎹泦鍑忓皯鍒嗘《鏁?
+            n_samples = len(z_test)
+            if n_samples < 2000:
+                WINDOW_SIZE = 50
+                INIT_WINDOWS = 5
+                PSI_BINS = 5
+                print(f"   [Config] Small dataset (N={n_samples}). Window=50, Bins=5.")
+            else:
+                WINDOW_SIZE = 128
+                INIT_WINDOWS = 5
+                PSI_BINS = 10
+                print(f"   [Config] Large dataset (N={n_samples}). Window=128, Bins=10.")
+
+            scale = dataset_s_map.get(name, 12.0)
+            
+            # A. 鏀堕泦缃俊搴?
+            all_confidences = []
+            BATCH_SIZE = 256
+            for i in range(0, len(z_test), BATCH_SIZE):
+                z_b = z_test[i:i+BATCH_SIZE]
+                logits = scale * torch.matmul(z_b, t_capa.T) + self.b_c
+                probs = torch.sigmoid(logits / self.T_opt)
+                confs = probs.max(dim=1).values.detach().cpu().numpy()
+                all_confidences.extend(confs)
+            
+            all_confidences = np.array(all_confidences)
+            
+            # B. 寤虹珛鍩哄噯
+            n_init_samples = WINDOW_SIZE * INIT_WINDOWS
+            if len(all_confidences) < n_init_samples + WINDOW_SIZE:
+                print(f"   [Skip] Not enough data.")
+                continue
+                
+            baseline_data = all_confidences[:n_init_samples]
+            monitor_data = all_confidences[n_init_samples:]
+            
+            # C. 鐩戞帶
+            psi_history = []
+            n_windows = int(np.ceil(len(monitor_data) / WINDOW_SIZE))
+            
+            for i in range(n_windows):
+                start = i * WINDOW_SIZE
+                end = min((i + 1) * WINDOW_SIZE, len(monitor_data))
+                if end - start < 10: break 
+                
+                curr_window_data = monitor_data[start:end]
+                
+                # 浣跨敤鍔ㄦ€佽瀹氱殑 bin 鏁伴噺
+                psi_val = self._compute_psi(baseline_data, curr_window_data, n_bins=PSI_BINS)
+                psi_history.append(psi_val)
+            
+            if not psi_history:
+                print("   [Skip] No valid windows.")
+                continue
+
+            # D. 缁熻
+            psi_arr = np.array(psi_history)
+            psi_min = psi_arr.min()
+            psi_med = np.median(psi_arr)
+            psi_max = psi_arr.max()
+            
+            # 绋嶅井鏀惧灏忔牱鏈殑 Max 闃堝€?(Median 鎵嶆槸鍏抽敭)
+            threshold = 0.4 if n_samples < 2000 else 0.25
+            status = "Stable" if psi_med < 0.25 else "Drift" # 涓昏鐪嬩腑浣嶆暟
+            
+            print(f"   [Stats] PSI -> Min: {psi_min:.4f} | Median: {psi_med:.4f} | Max: {psi_max:.4f}")
+            print(f"   [Result] System is {status} (Median < 0.25).")
+            
+            results.append({
+                "Dataset": name,
+                "PSI_Min": psi_min,
+                "PSI_Median": psi_med,
+                "PSI_Max": psi_max,
+                "Status": status
+            })
+
+        df = pd.DataFrame(results)
+        out_path = os.path.join(self.config.SAVE_DIR, "task3_psi_monitor_adaptive.csv")
+        df.to_csv(out_path, index=False)
+        print(f"\n [Done] Final PSI Report saved to {out_path}")
+
+    def _fmt_num(self, v: float, digits: int = 4, signed: bool = False) -> str:
+        if v is None or (not np.isfinite(v)):
+            return "NA"
+        av = abs(float(v))
+        sign_flag = "+" if signed else ""
+        if av >= 1e4 or (av > 0 and av < 1e-4):
+            return f"{float(v):{sign_flag}.{digits}e}"
+        return f"{float(v):{sign_flag}.{digits}f}"
+
+    def _fmt_p(self, p: float) -> str:
+        if p is None or (not np.isfinite(p)):
+            return "NA"
+        if p < 1e-4:
+            return "<1e-4"
+        if p < 1e-3:
+            return f"{p:.1e}"
+        return f"{p:.4f}"
+
+    def print_final_gate_summary(self, final_rows: List[Dict[str, object]], sim_source: Optional[str] = None):
+        sim_src = self._resolve_sim_source(sim_source)
+        name_map = {"MIMIC": "MIMIC-CXR"}
+        header = (
+            "Dataset    Sim_before  Sim_after  dSim     dOffDiag   dMacroAUC   95% CI           "
+            "p-value     dECE(%)"
+        )
+        sep = "-" * len(header)
+
+        lines = []
+        title = "Gate-centroid metrics" if sim_src == "gate" else "Dataset-centroid metrics"
+        lines.append(f"=== CAPA Final Summary ({title}) ===")
+        lines.append("")
+        if sim_src == "gate":
+            lines.append(
+                "Sim: class-wise mean paired cosine between Procrustes image centroids mu_c"
+            )
+            lines.append(
+                "     and text prototypes t_c in the aligned (center+whiten+norm) space over C_tau."
+            )
+            lines.append(
+                "Note: in gate mode, Sim columns are expected to be identical across datasets."
+            )
+        else:
+            lines.append(
+                "Sim: same paired-cosine formula, but mu_c is recomputed per evaluation dataset"
+            )
+            lines.append(
+                "     from dataset labels; R* and text prototypes t_c remain the frozen gate solution."
+            )
+        lines.append(
+            "dSim = Sim_after - Sim_before; negative dOffDiag indicates better separation."
+        )
+        lines.append("")
+        lines.append(header)
+        lines.append(sep)
+
+        sig_pos = []
+        neutral = []
+        for r in final_rows:
+            ds_name = str(r.get("Dataset", ""))
+            ds = name_map.get(ds_name, ds_name)
+            sim_b = float(r.get("Sim_Before", np.nan))
+            sim_a = float(r.get("Sim_After", np.nan))
+            dsim = float(r.get("Sim_Gain", np.nan))
+            doff = float(r.get("Delta_OffDiag", np.nan))
+            dauc = float(r.get("Delta_AUC_CAPA_minus_Baseline_Macro", np.nan))
+            ci_l = float(r.get("Delta_AUC_CI_Low", np.nan))
+            ci_h = float(r.get("Delta_AUC_CI_High", np.nan))
+            pval = float(r.get("Delta_AUC_DeLong_p", np.nan))
+            dece = float(r.get("Delta_ECE", np.nan))
+
+            ci_txt = f"[{self._fmt_num(ci_l)}, {self._fmt_num(ci_h)}]"
+            lines.append(
+                f"{ds:<10} {self._fmt_num(sim_b):>10} {self._fmt_num(sim_a):>10} {self._fmt_num(dsim, signed=True):>8} "
+                f"{self._fmt_num(doff, signed=True):>10} {self._fmt_num(dauc, signed=True):>11}   "
+                f"{ci_txt:<16} {self._fmt_p(pval):>9} {self._fmt_num(dece, signed=True):>10}"
+            )
+
+            if np.isfinite(dauc) and np.isfinite(pval) and pval < 0.05 and dauc > 0:
+                sig_pos.append(ds)
+            else:
+                neutral.append(ds)
+
+        if len(final_rows) == 0:
+            lines.append("(no datasets)")
+        else:
+            c0 = final_rows[0]
+            if "Calib_Sim_Before" in c0 and "Calib_Sim_After" in c0:
+                lines.append("")
+                lines.append(
+                    "Calibration-centroid (shared gate state): "
+                    f"Sim_before={self._fmt_num(float(c0.get('Calib_Sim_Before', np.nan)))}, "
+                    f"Sim_after={self._fmt_num(float(c0.get('Calib_Sim_After', np.nan)))}, "
+                    f"dSim={self._fmt_num(float(c0.get('Calib_Sim_Gain', np.nan)), signed=True)}, "
+                    f"dOffDiag={self._fmt_num(float(c0.get('Calib_Delta_OffDiag', np.nan)), signed=True)}"
+                )
+        lines.append("")
+        if len(sig_pos) > 0:
+            lines.append(
+                f"Summary: significant dMacroAUC gains on {', '.join(sig_pos)}; "
+                f"neutral/mixed on {', '.join(neutral) if neutral else 'none'}."
+            )
+        else:
+            lines.append(
+                f"Summary: no statistically significant positive dMacroAUC; "
+                f"neutral/mixed on {', '.join(neutral) if neutral else 'all datasets'}."
+            )
+        lines.append("Note: dMacroAUC is relative to the frozen zero-shot baseline.")
+        lines.append("      CAPA optimizes geometry (dSim); discrimination gains are indirect.")
+
+        print("\n".join(lines))
+
+    def print_three_way_auc_summary(self, final_rows: List[Dict[str, object]]):
+        header = (
+            "Dataset    BaseAUC    CAPA-AUC   CAPA+Cache   dAUC(CAPA)   dAUC(Cache)"
+        )
+        sep = "-" * len(header)
+        lines = ["=== Three-way AUC (Macro) ===", "", header, sep]
+        for r in final_rows:
+            ds = str(r.get("Dataset", ""))
+            b = float(r.get("AUC_Baseline_ZeroShot_Macro", np.nan))
+            c = float(r.get("AUC_CAPA_Aligned_Macro", np.nan))
+            cc = float(r.get("AUC_CAPA_Cache_Macro", np.nan))
+            dc = float(r.get("Delta_AUC_CAPA_minus_Baseline_Macro", np.nan))
+            dcc = float(r.get("Delta_AUC_CAPA_Cache_minus_Baseline_Macro", np.nan))
+            lines.append(
+                f"{ds:<10} {self._fmt_num(b):>9} {self._fmt_num(c):>10} {self._fmt_num(cc):>12} "
+                f"{self._fmt_num(dc, signed=True):>12} {self._fmt_num(dcc, signed=True):>12}"
+            )
+        if len(final_rows) == 0:
+            lines.append("(no datasets)")
+        print("\n".join(lines))
+
+    def run_shared_vs_per_dataset_capa(
+        self,
+        shared_rows: List[Dict[str, object]],
+        scoring_mode: Optional[str] = None,
+    ) -> pd.DataFrame:
+        mode = self._resolve_scoring_mode(scoring_mode)
+        shared_map: Dict[str, Dict[str, object]] = {}
+        for r in shared_rows:
+            key = self._canonical_dataset_name(str(r.get("Dataset", "")))
+            if key:
+                shared_map[key] = r
+
+        rows: List[Dict[str, object]] = []
+        self._log("[PerDatasetCAPA] running per-dataset CAPA branch ...", always=True)
+        for ds_name, path in self.config.TEST_DATA_PATHS.items():
+            key = self._canonical_dataset_name(ds_name)
+            if not os.path.exists(path):
+                continue
+
+            per_row: Dict[str, object] = {}
+            try:
+                cfg_ds = copy.deepcopy(self.config)
+                cfg_ds.DEBUG = False
+                cfg_ds.VERBOSE = False
+                cfg_ds.PRINT_SUMMARY = False
+                cfg_ds.TEST_DATA_PATHS = {key: path}
+                # Experimental branch: use same dataset file with split_override logic.
+                cfg_ds.TRAIN_DATA_PATH = path
+                cfg_ds.CALIB_DATA_PATH = path
+                cfg_ds.TAU_CALIB_DATA_PATH = path
+                cfg_ds.SAVE_DIR = os.path.join(self.config.SAVE_DIR, f"per_dataset_capa_{key.lower()}")
+                os.makedirs(cfg_ds.SAVE_DIR, exist_ok=True)
+
+                runner_ds = CAPA5NotebookRunner(cfg_ds)
+                runner_ds._build_prototypes()
+                if runner_ds.support_counts is None:
+                    runner_ds.support_counts = torch.ones(
+                        len(runner_ds.config.ORDERED_CLASS_NAMES),
+                        device=runner_ds.device,
+                    ) * runner_ds.config.N_MIN_SUPPORT_FOR_ACTIVE
+                if runner_ds.image_centroids is None:
+                    runner_ds.image_centroids = runner_ds.t_raw_pooled.clone()
+                if runner_ds.current_R is None:
+                    runner_ds.current_R = torch.eye(runner_ds.t_raw_pooled.shape[1], device=runner_ds.device)
+
+                runner_ds.run_pipeline()
+                per_rows = runner_ds.run_manuscript_validation(scoring_mode=mode, sim_source="dataset")
+                if len(per_rows) > 0:
+                    per_row = per_rows[0]
+                del runner_ds
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception as e:
+                self._log(f"[PerDatasetCAPA:{key}] failed: {e}", always=True)
+                per_row = {}
+
+            shared_row = shared_map.get(key, {})
+            shared_dauc = float(shared_row.get("Delta_AUC_CAPA_minus_Baseline_Macro", np.nan))
+            per_dauc = float(per_row.get("Delta_AUC_CAPA_minus_Baseline_Macro", np.nan))
+            rows.append(
+                {
+                    "Dataset": key,
+                    "Shared_dMacroAUC": shared_dauc,
+                    "PerDataset_dMacroAUC": per_dauc,
+                    "PerMinusShared_dMacroAUC": (per_dauc - shared_dauc)
+                    if np.isfinite(per_dauc) and np.isfinite(shared_dauc)
+                    else np.nan,
+                    "Shared_dECE": float(shared_row.get("Delta_ECE", np.nan)),
+                    "PerDataset_dECE": float(per_row.get("Delta_ECE", np.nan)),
+                    "Shared_dSim_dataset": float(shared_row.get("Sim_Gain", np.nan)),
+                    "PerDataset_dSim_dataset": float(per_row.get("Sim_Gain", np.nan)),
+                    "Shared_dSim_calib": float(shared_row.get("Calib_Sim_Gain", np.nan)),
+                    "PerDataset_dSim_calib": float(per_row.get("Calib_Sim_Gain", np.nan)),
+                }
+            )
+
+        df = pd.DataFrame(rows)
+        out_path = os.path.join(self.config.SAVE_DIR, f"shared_vs_per_dataset_capa_{mode}.csv")
+        df.to_csv(out_path, index=False)
+
+        header = "Dataset    dAUC(shared)  dAUC(per-ds)  per-shared   dSim_calib(shared)  dSim_calib(per-ds)"
+        sep = "-" * len(header)
+        lines = ["=== Shared vs Per-dataset CAPA ===", "", header, sep]
+        for r in rows:
+            lines.append(
+                f"{r['Dataset']:<10} "
+                f"{self._fmt_num(r['Shared_dMacroAUC'], signed=True):>12} "
+                f"{self._fmt_num(r['PerDataset_dMacroAUC'], signed=True):>12} "
+                f"{self._fmt_num(r['PerMinusShared_dMacroAUC'], signed=True):>11} "
+                f"{self._fmt_num(r['Shared_dSim_calib'], signed=True):>19} "
+                f"{self._fmt_num(r['PerDataset_dSim_calib'], signed=True):>20}"
+            )
+        if len(rows) == 0:
+            lines.append("(no datasets)")
+        lines.append("")
+        lines.append(f"[Saved] {out_path}")
+        print("\n".join(lines))
+        return df
+
+    def print_scoring_mode_comparison(
+        self,
+        rows_mixed: List[Dict[str, object]],
+        rows_softmax: List[Dict[str, object]],
+    ) -> pd.DataFrame:
+        by_ds_mixed = {str(r.get("Dataset", "")): r for r in rows_mixed}
+        by_ds_soft = {str(r.get("Dataset", "")): r for r in rows_softmax}
+        datasets = sorted(set(by_ds_mixed.keys()) | set(by_ds_soft.keys()))
+
+        comp_rows = []
+        win_mixed = 0
+        win_softmax = 0
+        ties = 0
+        for ds in datasets:
+            rm = by_ds_mixed.get(ds, {})
+            rs = by_ds_soft.get(ds, {})
+            dm = float(rm.get("Delta_AUC_CAPA_minus_Baseline_Macro", np.nan))
+            dsf = float(rs.get("Delta_AUC_CAPA_minus_Baseline_Macro", np.nan))
+            em = float(rm.get("ECE_Post", np.nan))
+            esf = float(rs.get("ECE_Post", np.nan))
+            gap_auc = dsf - dm
+            gap_ece = esf - em
+
+            winner = "Tie"
+            if np.isfinite(dm) and np.isfinite(dsf):
+                if abs(dsf - dm) > 1e-6:
+                    winner = "Softmax" if dsf > dm else "Mixed"
+                elif np.isfinite(em) and np.isfinite(esf) and abs(esf - em) > 1e-6:
+                    winner = "Softmax" if esf < em else "Mixed"
+            if winner == "Mixed":
+                win_mixed += 1
+            elif winner == "Softmax":
+                win_softmax += 1
+            else:
+                ties += 1
+
+            comp_rows.append(
+                {
+                    "Dataset": ds,
+                    "DeltaAUC_Mixed": dm,
+                    "DeltaAUC_Softmax": dsf,
+                    "Softmax_minus_Mixed_DeltaAUC": gap_auc,
+                    "ECE_Post_Mixed": em,
+                    "ECE_Post_Softmax": esf,
+                    "Softmax_minus_Mixed_ECE": gap_ece,
+                    "Winner": winner,
+                }
+            )
+
+        df = pd.DataFrame(comp_rows)
+        out_path = os.path.join(self.config.SAVE_DIR, "scoring_mode_comparison.csv")
+        df.to_csv(out_path, index=False)
+
+        header = (
+            "Dataset    螖AUC(mixed)  螖AUC(softmax)  softmax-mixed  "
+            "ECE%(mixed)  ECE%(softmax)  Winner"
+        )
+        sep = "-" * len(header)
+        lines = ["=== Scoring Mode Comparison (same frozen state) ===", "", header, sep]
+        for r in comp_rows:
+            lines.append(
+                f"{r['Dataset']:<10} {self._fmt_num(r['DeltaAUC_Mixed'], signed=True):>11} "
+                f"{self._fmt_num(r['DeltaAUC_Softmax'], signed=True):>14} "
+                f"{self._fmt_num(r['Softmax_minus_Mixed_DeltaAUC'], signed=True):>14} "
+                f"{self._fmt_num(r['ECE_Post_Mixed']):>12} {self._fmt_num(r['ECE_Post_Softmax']):>14} "
+                f"{r['Winner']:>7}"
+            )
+        lines.append("")
+        lines.append(f"Summary: Mixed wins={win_mixed}, Softmax wins={win_softmax}, Tie={ties}.")
+        lines.append(f"[Saved] {out_path}")
+        print("\n".join(lines))
+        return df
+
+    def _run_evaluation(self):
+        gate_pass = bool(self.final_alignment_stats.get("gate_pass", False)) if isinstance(self.final_alignment_stats, dict) else False
+        soft_fallback = bool(self.final_alignment_stats.get("soft_fallback", False)) if isinstance(self.final_alignment_stats, dict) else False
+        if gate_pass or self.is_frozen:
+            status = "ACCEPTED (Frozen R*)"
+        elif soft_fallback:
+            status = "SOFT-FALLBACK (Guarded R)"
+        elif isinstance(self.R_frozen, torch.Tensor):
+            I_eval = torch.eye(self.R_frozen.shape[0], device=self.R_frozen.device, dtype=self.R_frozen.dtype)
+            if torch.norm(self.R_frozen - I_eval).item() > 1e-3:
+                status = "UPDATED (Unfrozen R)"
+            else:
+                status = "REJECTED (Identity)"
+        else:
+            status = "REJECTED (Identity)"
+        self._log(f"\n[Stage IV] Evaluation ({status})")
+        
+        t_base = self.t_raw_pooled
+        t_align_base = self._get_alignment_text_base()
+        t_capa = self._l2_norm(torch.matmul(t_align_base, self.R_frozen.T))
+        gate_sim = self._compute_dataset_alignment_stats(
+            z_embed=None,
+            y_labels=None,
+            t_base=t_align_base,
+            t_rot=t_capa,
+            sim_source="gate",
+        )
+        rows = []
+        
+        
+        for name, path in self.config.TEST_DATA_PATHS.items():
+            if not os.path.exists(path): continue
+            z_test, y_test, is_multi = self._load_data(path, split_override=2)
+            if y_test is None: continue
+            
+            z_test = self._apply_preprocessing(z_test, self.zI_mean)
+            dataset_sim_eval = self._compute_dataset_alignment_stats(
+                z_embed=z_test,
+                y_labels=y_test,
+                t_base=t_align_base,
+                t_rot=t_capa,
+                dataset_name=name,
+                sim_source="dataset",
+            )
+            t_eval = t_capa
+            res_base = self._compute_metrics(z_test, y_test, is_multi, t_base, dataset_name=name)
+            res_capa = self._compute_metrics(
+                z_test,
+                y_test,
+                is_multi,
+                t_eval,
+                dataset_name=name,
+                baseline_t_protos=t_base,
+            )
+            res_capa_cache = self._compute_metrics(
+                z_test,
+                y_test,
+                is_multi,
+                t_eval,
+                dataset_name=name,
+                use_cache=self._is_cache_enabled(),
+                baseline_t_protos=t_base,
+            )
+
+            dataset_sim = dataset_sim_eval
+            
+            if np.isnan(res_capa["Macro-AUC"]):
+                continue
+            gain = float(res_capa["Macro-AUC"] - res_base["Macro-AUC"])
+            rows.append({
+                "Line": "capav1_gt",
+                "Dataset": name,
+                "MacroAUC_Base": res_base["Macro-AUC"],
+                "MacroAUC_CAPA": res_capa["Macro-AUC"],
+                "MacroAUC_CAPA_Cache": res_capa_cache["Macro-AUC"],
+                "MicroAUC_Base": res_base["Micro-AUC"],
+                "MicroAUC_CAPA": res_capa["Micro-AUC"],
+                "MicroAUC_CAPA_Cache": res_capa_cache["Micro-AUC"],
+                "ECE_Base": res_base["ECE"],
+                "ECE_CAPA": res_capa["ECE"],
+                "ECE_CAPA_Cache": res_capa_cache["ECE"],
+                "Gain_MacroAUC": gain,
+                "Gain_MacroAUC_Cache": float(res_capa_cache["Macro-AUC"] - res_base["Macro-AUC"])
+                if np.isfinite(res_capa_cache["Macro-AUC"]) and np.isfinite(res_base["Macro-AUC"])
+                else np.nan,
+                "Sim_Before": dataset_sim["sim_before"],
+                "Sim_After": dataset_sim["sim_after"],
+                "SimGain": dataset_sim["sim_gain"],
+                "OffDiag_Post_Mean": dataset_sim["off_diag_post_mean"],
+            })
+
+        if rows:
+            out_path = os.path.join(self.config.SAVE_DIR, "stage_iv_eval.csv")
+            pd.DataFrame(rows).to_csv(out_path, index=False)
+            self._log(f"[Saved] {out_path}")
+
+        if self.config.PRINT_SUMMARY and rows and self.config.VERBOSE:
+            print(f"{'Dataset':<12} | {'MacroAUC':<8} | {'MicroAUC':<8} | {'ECE%':<6} | {'Gain':<8} | {'SimGain':<8} | {'OffDiag':<8}")
+            print("-" * 90)
+            for r in rows:
+                g = float(r["Gain_MacroAUC"])
+                sym = "^" if g > 0 else "v"
+                print(f"{r['Dataset']:<12} | {r['MacroAUC_CAPA']:.4f}   | {r['MicroAUC_CAPA']:.4f}   | {r['ECE_CAPA']:.2f}   | {sym} {abs(g):.4f} | {r['SimGain']:+.4f} | {r['OffDiag_Post_Mean']:+.4f}")
+                print("-" * 90)
+
+def _parse_float_csv(text: Optional[str]) -> Optional[List[float]]:
+    if text is None:
+        return None
+    items: List[float] = []
+    for raw in str(text).split(","):
+        token = raw.strip()
+        if not token:
+            continue
+        items.append(float(token))
+    return items if items else None
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="CAPAv1-GT mainline runner")
+    parser.add_argument("--debug", action="store_true", help="Enable detailed debug prints.")
+    parser.add_argument(
+        "--param-profile",
+        type=str,
+        default="default",
+        choices=["default", "professor"],
+        help="Parameter strategy profile: original defaults or professor-style auto rules.",
+    )
+    parser.add_argument(
+        "--label-space",
+        type=str,
+        default="chexpert5",
+        choices=["14", "chexpert5", "unified5"],
+        help="Internal semantic label space used end-to-end.",
+    )
+    parser.add_argument(
+        "--source-label-order-profile",
+        type=str,
+        default="chexpert5_reordered_200x5",
+        choices=["default", "chexpert5_reordered_200x5"],
+        help="How to interpret source label order when a file does not store class_names.",
+    )
+    parser.add_argument(
+        "--init-temperature",
+        type=float,
+        default=None,
+        help="Override INIT_TEMPERATURE used for default evaluation/calibration.",
+    )
+    parser.add_argument(
+        "--init-scale",
+        type=float,
+        default=None,
+        help="Override INIT_SCALE_FACTOR used for logits.",
+    )
+    parser.add_argument(
+        "--min-classes-adapt",
+        type=int,
+        default=None,
+        help="Override MIN_CLASSES_FOR_ADAPTATION gate.",
+    )
+    parser.add_argument(
+        "--scoring-mode",
+        type=str,
+        default="mixed",
+        choices=["mixed", "softmax"],
+        help="Scoring mode for evaluation outputs.",
+    )
+    parser.add_argument(
+        "--sim-source",
+        type=str,
+        default="gate",
+        choices=["gate", "dataset"],
+        help="Centroid source for Sim metrics: gate centroids or per-dataset centroids.",
+    )
+    parser.add_argument(
+        "--compare-softmax",
+        action="store_true",
+        help="Run manuscript validation in both mixed and softmax modes and print a comparison table.",
+    )
+    parser.add_argument(
+        "--cache-mode",
+        type=str,
+        default="off",
+        choices=["off", "gated"],
+        help="Cache policy for evaluation: off or gated expert.",
+    )
+    parser.add_argument(
+        "--cache-alpha-max",
+        type=float,
+        default=0.10,
+        help="Maximum sample-wise cache blend alpha.",
+    )
+    parser.add_argument(
+        "--cache-topk",
+        type=int,
+        default=16,
+        help="Top-K nearest neighbors for cache expert.",
+    )
+    parser.add_argument(
+        "--cache-temp",
+        type=float,
+        default=0.08,
+        help="Softmax temperature for cache neighbor weighting.",
+    )
+    parser.add_argument(
+        "--cache-dataset-psi-thr",
+        type=float,
+        default=0.25,
+        help="Dataset-level PSI threshold; cache is disabled for the whole dataset above this drift level.",
+    )
+    parser.add_argument(
+        "--cache-min-sim-q",
+        type=float,
+        default=0.25,
+        help="Reference quantile used to derive sample-level minimum top1 similarity.",
+    )
+    parser.add_argument(
+        "--cache-min-purity-q",
+        type=float,
+        default=0.50,
+        help="Reference quantile used to derive sample-level minimum neighbor purity.",
+    )
+    parser.add_argument(
+        "--cache-max-entropy-q",
+        type=float,
+        default=0.75,
+        help="Reference quantile used to derive sample-level maximum cache entropy.",
+    )
+    parser.add_argument(
+        "--cache-require-agree",
+        type=str,
+        default="on",
+        choices=["on", "off"],
+        help="Require cache top1 to agree with the base model before cache can contribute.",
+    )
+    parser.add_argument(
+        "--kappa0",
+        type=float,
+        default=0.0,
+        help="vMF shrink strength for centroid EMA update.",
+    )
+    parser.add_argument(
+        "--n-min-support",
+        type=int,
+        default=8,
+        help="Minimum true support per class to join C_tau (Procrustes/gate).",
+    )
+    parser.add_argument(
+        "--n-cap",
+        type=int,
+        default=500,
+        help="Support cap N_cap in class-weight formula.",
+    )
+    parser.add_argument(
+        "--gamma-weight",
+        type=float,
+        default=0.5,
+        help="Gamma in class-weight formula.",
+    )
+    parser.add_argument(
+        "--beta-weight",
+        type=float,
+        default=0.2,
+        help="Beta in class-weight formula (under-aligned emphasis).",
+    )
+    parser.add_argument(
+        "--hard-neg",
+        type=str,
+        default="off",
+        choices=["on", "off"],
+        help="Enable/disable hard-negative Procrustes term: M = M_pos - beta*M_neg.",
+    )
+    parser.add_argument(
+        "--hard-neg-beta",
+        type=float,
+        default=0.15,
+        help="Hard-negative coefficient beta for Procrustes.",
+    )
+    parser.add_argument(
+        "--hard-neg-topk",
+        type=int,
+        default=3,
+        help="Top-K hardest non-matching prototypes per class for M_neg.",
+    )
+    parser.add_argument(
+        "--hard-neg-temp",
+        type=float,
+        default=0.07,
+        help="Softmax temperature for hard-negative weighting.",
+    )
+    parser.add_argument(
+        "--rho",
+        type=float,
+        default=0.85,
+        help="Base rho gate upper bound on post-rotation paired cosine.",
+    )
+    parser.add_argument(
+        "--rho-quantile-gate",
+        type=str,
+        default="off",
+        choices=["on", "off"],
+        help="Use quantile-based conservative rho for gate.",
+    )
+    parser.add_argument(
+        "--rho-quantile",
+        type=float,
+        default=0.70,
+        help="Quantile used to derive conservative rho when enabled.",
+    )
+    parser.add_argument(
+        "--gate-offdiag",
+        type=str,
+        default="off",
+        choices=["on", "off"],
+        help="Require off-diagonal change to stay below threshold in gate.",
+    )
+    parser.add_argument(
+        "--gate-max-offdiag-delta",
+        type=float,
+        default=0.0,
+        help="Max allowed dOffDiag in gate (<=0 means stricter separation).",
+    )
+    parser.add_argument(
+        "--soft-fusion",
+        type=str,
+        default="on",
+        choices=["on", "off"],
+        help="Enable/disable CAPA-baseline soft fusion: lambda*capa + (1-lambda)*baseline.",
+    )
+    parser.add_argument(
+        "--soft-fusion-lambda",
+        type=float,
+        default=1.0,
+        help="Lambda for CAPA-baseline soft fusion.",
+    )
+    parser.add_argument(
+        "--guarded-alphas",
+        type=str,
+        default=None,
+        help="Comma-separated guarded alpha candidates for GT soft fallback, e.g. 1.0,0.85,0.7,0.55,0.4",
+    )
+    parser.add_argument(
+        "--go-guardian",
+        type=str,
+        default="off",
+        choices=["on", "off"],
+        help="Enable/disable GO Guardian Stage-1 (PSI monitoring + freeze/rollback).",
+    )
+    parser.add_argument(
+        "--go-psi-window",
+        type=int,
+        default=512,
+        help="Sliding window size for Guardian PSI.",
+    )
+    parser.add_argument(
+        "--go-psi-bins",
+        type=int,
+        default=10,
+        help="Histogram bins for Guardian PSI.",
+    )
+    parser.add_argument(
+        "--go-psi-thr",
+        type=float,
+        default=2.0,
+        help="PSI alarm threshold; above this triggers freeze.",
+    )
+    parser.add_argument(
+        "--go-tau-resume",
+        type=float,
+        default=1.0,
+        help="Resume threshold; need consecutive windows below this to unfreeze.",
+    )
+    parser.add_argument(
+        "--go-resume-windows",
+        type=int,
+        default=3,
+        help="Consecutive low-PSI windows required to resume from freeze.",
+    )
+    parser.add_argument(
+        "--go-warmup-steps",
+        type=int,
+        default=50,
+        help="GO disabled before this step index.",
+    )
+    parser.add_argument(
+        "--go-baseline-collect-steps",
+        type=int,
+        default=50,
+        help="Steps used to collect GO baseline histogram after GO warmup.",
+    )
+    parser.add_argument(
+        "--go-dry-run",
+        type=str,
+        default="off",
+        choices=["on", "off"],
+        help="Dry-run GO alarms without freezing/rollback.",
+    )
+    parser.add_argument(
+        "--go-ml-proj",
+        type=str,
+        default="on",
+        choices=["on", "off"],
+        help="Enable/disable GO multi-label order-free residual projection updates.",
+    )
+    parser.add_argument(
+        "--go-ml-tau",
+        type=float,
+        default=1e-2,
+        help="Base ridge tau for GO multi-label projection.",
+    )
+    parser.add_argument(
+        "--go-ml-cond-target",
+        type=float,
+        default=1e3,
+        help="Target condition-number upper bound for (T^T T + tau I).",
+    )
+    parser.add_argument(
+        "--go-ml-residual-norm",
+        type=str,
+        default="on",
+        choices=["on", "off"],
+        help="Use residual norm as extra sample weight in GO multi-label update.",
+    )
+    parser.add_argument(
+        "--go-ml-signal",
+        type=str,
+        default="original",
+        choices=["original", "residual"],
+        help="Signal vector for GO multi-label update: original embedding or residual direction.",
+    )
+    parser.add_argument(
+        "--compare-per-dataset-capa",
+        action="store_true",
+        help="Run experimental shared-CAPA vs per-dataset-CAPA comparison.",
+    )
+    parser.add_argument(
+        "--save-dir",
+        type=str,
+        default=None,
+        help="Optional output directory. If omitted, use config default SAVE_DIR.",
+    )
+    args = parser.parse_args()
+    base_cfg = CAPA5Config(
+        LABEL_SPACE=str(args.label_space),
+        PARAM_PROFILE=str(args.param_profile),
+        SOURCE_LABEL_ORDER_PROFILE=str(args.source_label_order_profile),
+    )
+    guarded_alphas_override = _parse_float_csv(args.guarded_alphas)
+    config = CAPA5Config(
+        PARAM_PROFILE=str(args.param_profile),
+        LABEL_SPACE=str(args.label_space),
+        SOURCE_LABEL_ORDER_PROFILE=str(args.source_label_order_profile),
+        DEBUG=bool(args.debug),
+        VERBOSE=bool(args.debug),
+        PRINT_SUMMARY=False,
+        INIT_TEMPERATURE=(
+            float(args.init_temperature) if args.init_temperature is not None else float(base_cfg.INIT_TEMPERATURE)
+        ),
+        INIT_SCALE_FACTOR=(
+            float(args.init_scale) if args.init_scale is not None else float(base_cfg.INIT_SCALE_FACTOR)
+        ),
+        MIN_CLASSES_FOR_ADAPTATION=(
+            max(1, int(args.min_classes_adapt))
+            if args.min_classes_adapt is not None
+            else int(base_cfg.MIN_CLASSES_FOR_ADAPTATION)
+        ),
+        SCORING_MODE=str(args.scoring_mode),
+        SIM_SOURCE=str(args.sim_source),
+        CACHE_MODE=str(args.cache_mode),
+        CACHE_ALPHA_MAX=min(1.0, max(0.0, float(args.cache_alpha_max))),
+        CACHE_TOPK=max(1, int(args.cache_topk)),
+        CACHE_TEMP=max(1e-4, float(args.cache_temp)),
+        CACHE_DATASET_PSI_THR=max(0.0, float(args.cache_dataset_psi_thr)),
+        CACHE_MIN_SIM_Q=min(1.0, max(0.0, float(args.cache_min_sim_q))),
+        CACHE_MIN_PURITY_Q=min(1.0, max(0.0, float(args.cache_min_purity_q))),
+        CACHE_MAX_ENTROPY_Q=min(1.0, max(0.0, float(args.cache_max_entropy_q))),
+        CACHE_REQUIRE_AGREE=(str(args.cache_require_agree).lower() == "on"),
+        KAPPA0=max(0.0, float(args.kappa0)),
+        N_MIN_SUPPORT_FOR_ACTIVE=max(1, int(args.n_min_support)),
+        N_CAP=max(1, int(args.n_cap)),
+        GAMMA_WEIGHT=max(0.0, float(args.gamma_weight)),
+        BETA_WEIGHT=max(0.0, float(args.beta_weight)),
+        ENABLE_HARD_NEG_PROCRUSTES=(str(args.hard_neg).lower() == "on"),
+        HARD_NEG_BETA=max(0.0, float(args.hard_neg_beta)),
+        HARD_NEG_TOPK=max(1, int(args.hard_neg_topk)),
+        HARD_NEG_TEMP=max(1e-4, float(args.hard_neg_temp)),
+        RHO=float(args.rho),
+        GATE_USE_RHO_QUANTILE=(str(args.rho_quantile_gate).lower() == "on"),
+        RHO_QUANTILE=min(1.0, max(0.0, float(args.rho_quantile))),
+        GATE_REQUIRE_OFFDIAG_IMPROVEMENT=(str(args.gate_offdiag).lower() == "on"),
+        GATE_MAX_OFFDIAG_DELTA=float(args.gate_max_offdiag_delta),
+        ENABLE_CAPA_BASELINE_SOFT_FUSION=(str(args.soft_fusion).lower() == "on"),
+        CAPA_BASELINE_FUSION_LAMBDA=min(1.0, max(0.0, float(args.soft_fusion_lambda))),
+        CAPAV1_GUARDED_ALPHAS=(
+            guarded_alphas_override
+            if guarded_alphas_override is not None
+            else list(base_cfg.CAPAV1_GUARDED_ALPHAS)
+        ),
+        ENABLE_GO_GUARDIAN=(str(args.go_guardian).lower() == "on"),
+        GO_PSI_WINDOW=max(16, int(args.go_psi_window)),
+        GO_PSI_BINS=max(5, int(args.go_psi_bins)),
+        GO_PSI_THR=max(0.0, float(args.go_psi_thr)),
+        GO_TAU_RESUME=max(0.0, float(args.go_tau_resume)),
+        GO_RESUME_WINDOWS=max(1, int(args.go_resume_windows)),
+        GO_WARMUP_STEPS=max(0, int(args.go_warmup_steps)),
+        GO_BASELINE_COLLECT_STEPS=max(0, int(args.go_baseline_collect_steps)),
+        GO_DRY_RUN=(str(args.go_dry_run).lower() == "on"),
+        ENABLE_GO_MULTILABEL_PROJECTION=(str(args.go_ml_proj).lower() == "on"),
+        GO_ML_TAU_BASE=max(1e-8, float(args.go_ml_tau)),
+        GO_ML_COND_TARGET=max(1.01, float(args.go_ml_cond_target)),
+        GO_ML_USE_RESIDUAL_NORM_WEIGHT=(str(args.go_ml_residual_norm).lower() == "on"),
+        GO_ML_SIGNAL_USE_ORIGINAL=(str(args.go_ml_signal).lower() == "original"),
+        SAVE_DIR=(str(args.save_dir) if args.save_dir else base_cfg.SAVE_DIR),
+    )
+    runner = CAPA5NotebookRunner(config)
+
+    if config.VERBOSE:
+        print("[Checks] Quick sanity checks")
+        for path in [config.CALIB_DATA_PATH, config.TRAIN_DATA_PATH] + list(config.TEST_DATA_PATHS.values()):
+            if not os.path.exists(path):
+                print(f"  [WARN] Missing path: {path}")
+                continue
+            z, y, is_multi = runner._load_data(path, is_calibration=('calib' in path.lower()))
+            D = z.shape[1]
+            print(f"  {os.path.basename(path)} -> N={len(z)}, D={D}, labels_present={y is not None}, multi={is_multi}")
+
+    runner._build_prototypes()
+    if config.VERBOSE:
+        print("  prototypes raw/processed shapes:", runner.t_raw_pooled_raw.shape, runner.t_raw_pooled.shape)
+        assert runner.t_raw_pooled.shape == runner.t_raw_pooled_raw.shape
+
+    # Ensure minimal state for diagnostics
+    if runner.support_counts is None:
+        runner.support_counts = torch.ones(len(runner.config.ORDERED_CLASS_NAMES), device=runner.device) * runner.config.N_MIN_SUPPORT_FOR_ACTIVE
+    if runner.image_centroids is None:
+        runner.image_centroids = runner.t_raw_pooled.clone()
+    if runner.current_R is None:
+        runner.current_R = torch.eye(runner.t_raw_pooled.shape[1], device=runner.device)
+
+    if config.VERBOSE and runner.W_zca is not None:
+        WT = runner.W_zca.cpu().numpy()
+        I_approx = WT @ np.linalg.pinv(WT)
+        print("  ZCA approx identity max_err:", np.max(np.abs(I_approx - np.eye(I_approx.shape[0]))))
+
+    d = runner.t_raw_pooled.shape[1]
+    I = torch.eye(d, device=runner.device)
+    if config.VERBOSE:
+        Rtest = runner._solve_procrustes()
+        ortho_err = torch.norm(Rtest @ Rtest.T - I).item()
+        print("  Procrustes R ortho_err:", ortho_err)
+        assert ortho_err < 1e-3, "Procrustes R not sufficiently orthogonal"
+    
+    # Run full pipeline to freeze R and save state
+    runner.run_pipeline()
+
+    # Final manuscript validation with locked scales/priors and plotting
+    if args.compare_softmax:
+        rows_mixed = runner.run_manuscript_validation(scoring_mode="mixed", sim_source=config.SIM_SOURCE)
+        rows_softmax = runner.run_manuscript_validation(scoring_mode="softmax", sim_source=config.SIM_SOURCE)
+        runner.print_scoring_mode_comparison(rows_mixed, rows_softmax)
+        rows_selected = rows_mixed if config.SCORING_MODE == "mixed" else rows_softmax
+        runner.print_final_gate_summary(rows_selected, sim_source=config.SIM_SOURCE)
+        runner.print_three_way_auc_summary(rows_selected)
+        if args.compare_per_dataset_capa:
+            runner.run_shared_vs_per_dataset_capa(rows_selected, scoring_mode=config.SCORING_MODE)
+    else:
+        final_rows = runner.run_manuscript_validation(
+            scoring_mode=config.SCORING_MODE,
+            sim_source=config.SIM_SOURCE,
+        )
+        runner.print_final_gate_summary(final_rows, sim_source=config.SIM_SOURCE)
+        runner.print_three_way_auc_summary(final_rows)
+        if args.compare_per_dataset_capa:
+            runner.run_shared_vs_per_dataset_capa(final_rows, scoring_mode=config.SCORING_MODE)
+
