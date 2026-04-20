@@ -32,7 +32,17 @@ from tqdm import tqdm
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 warnings.filterwarnings("ignore", category=UndefinedMetricWarning)
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+def _resolve_project_root() -> Path:
+    here = Path(__file__).resolve()
+    candidates = [here.parents[1], here.parents[2]]
+    for candidate in candidates:
+        if any((candidate / name).exists() for name in ("data", "model", "results")):
+            return candidate
+    return here.parents[1]
+
+
+PROJECT_ROOT = _resolve_project_root()
 DEFAULT_MODEL_DIR = PROJECT_ROOT / "model"
 DEFAULT_DATA_DIR = PROJECT_ROOT / "data"
 DEFAULT_RESULTS_DIR = PROJECT_ROOT / "results"
@@ -101,6 +111,469 @@ MEDICAL_SYNONYM_MAP_5 = {
     "Lung Lesion": ["lung lesion", "pulmonary nodule", "mass"],
     "Pleural Other": ["pleural abnormality", "pleural thickening"],
 }
+PROMPT_BUCKET_ORDER = [
+    "impression",
+    "finding",
+    "anatomy",
+    "morphology",
+    "severity",
+    "context",
+]
+PROMPT_BUCKET_TEMPLATES_V1 = {
+    "impression": [
+        "Impression: {phrase}.",
+        "Overall impression: {phrase}.",
+    ],
+    "finding": [
+        "Chest radiograph shows {phrase}.",
+        "There is {phrase}.",
+    ],
+    "anatomy": [
+        "{phrase} is seen on this chest radiograph.",
+        "This frontal chest X-ray demonstrates {phrase}.",
+    ],
+    "morphology": [
+        "Imaging shows {phrase}.",
+        "A chest X-ray pattern of {phrase} is present.",
+    ],
+    "severity": [
+        "Findings are consistent with {phrase}.",
+        "This study shows {phrase}.",
+    ],
+    "context": [
+        "On frontal chest radiograph, {phrase}.",
+        "Portable chest radiograph demonstrates {phrase}.",
+    ],
+}
+STRUCTURED_PROMPT_PHRASE_BANK_CHEXPERT5 = {
+    "Atelectasis": {
+        "impression": [
+            "mild bibasilar atelectatic change",
+            "subsegmental atelectatic opacity",
+        ],
+        "finding": [
+            "atelectatic opacity",
+            "collapsed lung tissue",
+        ],
+        "anatomy": [
+            "basilar atelectatic change",
+            "linear bibasal atelectatic opacity",
+        ],
+        "morphology": [
+            "volume-loss related linear opacity",
+            "subsegmental plate-like atelectatic change",
+        ],
+        "severity": [
+            "mild atelectasis",
+            "moderate bibasal atelectatic change",
+        ],
+        "context": [
+            "low-volume bibasal atelectatic opacity is present",
+        ],
+    },
+    "Cardiomegaly": {
+        "impression": [
+            "cardiomegaly",
+            "enlargement of the cardiac silhouette",
+        ],
+        "finding": [
+            "an enlarged cardiac silhouette",
+            "cardiomediastinal enlargement",
+        ],
+        "anatomy": [
+            "enlargement of the cardiomediastinal silhouette",
+            "mild enlargement of the heart shadow",
+        ],
+        "morphology": [
+            "globular cardiac enlargement",
+            "prominent cardiomediastinal contour",
+        ],
+        "severity": [
+            "mild cardiomegaly",
+            "marked enlargement of the cardiac silhouette",
+        ],
+        "context": [
+            "frontal chest radiograph shows cardiomediastinal enlargement",
+        ],
+    },
+    "Consolidation": {
+        "impression": [
+            "focal consolidation",
+            "patchy airspace consolidation",
+        ],
+        "finding": [
+            "airspace consolidation",
+            "focal lung consolidation",
+        ],
+        "anatomy": [
+            "lobar airspace opacity",
+            "unilateral patchy airspace opacity",
+        ],
+        "morphology": [
+            "dense focal airspace opacity",
+            "multifocal patchy consolidative opacity",
+        ],
+        "severity": [
+            "mild focal consolidation",
+            "extensive airspace consolidation",
+        ],
+        "context": [
+            "frontal chest radiograph demonstrates focal airspace consolidation",
+        ],
+    },
+    "Edema": {
+        "impression": [
+            "pulmonary edema",
+            "diffuse edema pattern",
+        ],
+        "finding": [
+            "bilateral pulmonary edema",
+            "interstitial edema",
+        ],
+        "anatomy": [
+            "perihilar edema opacity",
+            "diffuse bilateral pulmonary opacification related to edema",
+        ],
+        "morphology": [
+            "interstitial to alveolar edema pattern",
+            "bilateral hazy perihilar opacity",
+        ],
+        "severity": [
+            "mild pulmonary edema",
+            "marked diffuse pulmonary edema",
+        ],
+        "context": [
+            "portable chest radiograph shows bilateral pulmonary edema pattern",
+        ],
+    },
+    "Pleural Effusion": {
+        "impression": [
+            "pleural effusion",
+            "bilateral pleural effusions",
+        ],
+        "finding": [
+            "pleural fluid",
+            "fluid in the pleural space",
+        ],
+        "anatomy": [
+            "blunting of the costophrenic angle from pleural fluid",
+            "dependent pleural fluid collection",
+        ],
+        "morphology": [
+            "small pleural effusion with meniscus configuration",
+            "layering pleural fluid opacity",
+        ],
+        "severity": [
+            "small pleural effusion",
+            "moderate to large pleural effusion",
+        ],
+        "context": [
+            "frontal chest radiograph demonstrates pleural fluid with blunted costophrenic angle",
+        ],
+    },
+}
+STRUCTURED_PROMPT_PHRASE_BANK_CHEXPERT5_V2 = {
+    "Atelectasis": {
+        "impression": [
+            "mild bibasal atelectatic change",
+            "subsegmental atelectatic change",
+        ],
+        "finding": [
+            "linear atelectatic opacity",
+            "basilar atelectatic opacity",
+        ],
+        "anatomy": [
+            "bibasal linear opacity with volume loss",
+            "left basilar atelectatic change",
+        ],
+        "morphology": [
+            "plate-like atelectatic opacity",
+            "low-volume linear opacity",
+        ],
+        "severity": [
+            "mild atelectatic change",
+        ],
+    },
+    "Cardiomegaly": {
+        "impression": [
+            "cardiomegaly",
+            "mild cardiomegaly",
+        ],
+        "finding": [
+            "enlarged cardiac silhouette",
+            "cardiomediastinal enlargement",
+        ],
+        "anatomy": [
+            "enlargement of the cardiac silhouette",
+            "prominent cardiomediastinal silhouette",
+        ],
+        "morphology": [
+            "globular enlargement of the cardiac silhouette",
+            "cardiac silhouette enlargement",
+        ],
+        "severity": [
+            "marked cardiomegaly",
+        ],
+    },
+    "Consolidation": {
+        "impression": [
+            "focal airspace consolidation",
+            "patchy airspace opacity",
+        ],
+        "finding": [
+            "focal airspace opacity",
+            "patchy consolidative opacity",
+        ],
+        "anatomy": [
+            "right basilar airspace opacity",
+            "lobar airspace opacity",
+        ],
+        "morphology": [
+            "dense consolidative opacity",
+            "multifocal patchy airspace opacity",
+        ],
+        "severity": [
+            "mild focal consolidation",
+        ],
+    },
+    "Edema": {
+        "impression": [
+            "pulmonary edema",
+            "mild pulmonary edema",
+        ],
+        "finding": [
+            "bilateral interstitial pulmonary opacity",
+            "bilateral perihilar hazy opacity",
+        ],
+        "anatomy": [
+            "bilateral perihilar opacity",
+            "diffuse bilateral pulmonary opacity",
+        ],
+        "morphology": [
+            "interstitial edema pattern",
+            "alveolar edema pattern",
+        ],
+        "severity": [
+            "marked bilateral pulmonary edema",
+        ],
+    },
+    "Pleural Effusion": {
+        "impression": [
+            "pleural effusion",
+            "small pleural effusion",
+        ],
+        "finding": [
+            "pleural fluid",
+            "blunting of the costophrenic angle",
+        ],
+        "anatomy": [
+            "left pleural effusion",
+            "bilateral pleural effusions",
+        ],
+        "morphology": [
+            "layering pleural fluid",
+            "meniscus-like pleural opacity",
+        ],
+        "severity": [
+            "moderate pleural effusion",
+        ],
+    },
+}
+STRUCTURED_PROMPT_PHRASE_BANK_CHEXPERT5_REPORT = {
+    "Atelectasis": {
+        "impression": [
+            "mild bibasal atelectatic change",
+            "low-volume bibasal atelectatic opacity",
+        ],
+        "finding": [
+            "bibasal linear atelectatic opacity",
+            "subsegmental atelectatic change",
+        ],
+        "anatomy": [
+            "left basilar atelectatic change",
+            "right basilar plate-like atelectatic opacity",
+        ],
+        "morphology": [
+            "linear bibasal opacity with volume loss",
+        ],
+    },
+    "Cardiomegaly": {
+        "impression": [
+            "mild cardiomegaly",
+            "enlargement of the cardiac silhouette",
+        ],
+        "finding": [
+            "cardiomediastinal silhouette is enlarged",
+            "mild enlargement of the heart shadow",
+        ],
+        "anatomy": [
+            "prominent cardiomediastinal silhouette",
+            "mild cardiac silhouette enlargement",
+        ],
+        "morphology": [
+            "stable appearing enlargement of the cardiac silhouette",
+        ],
+    },
+    "Consolidation": {
+        "impression": [
+            "focal airspace opacity",
+            "patchy basilar airspace opacity",
+        ],
+        "finding": [
+            "patchy lower lung airspace opacity",
+            "focal consolidative opacity",
+        ],
+        "anatomy": [
+            "right basilar airspace opacity",
+            "left lower lung consolidative opacity",
+        ],
+        "morphology": [
+            "patchy focal consolidative change",
+        ],
+    },
+    "Edema": {
+        "impression": [
+            "mild pulmonary edema",
+            "mild diffuse interstitial edema pattern",
+        ],
+        "finding": [
+            "bilateral perihilar interstitial opacity",
+            "diffuse bilateral pulmonary vascular-interstitial opacity",
+        ],
+        "anatomy": [
+            "mild bilateral perihilar hazy opacity",
+            "central bilateral interstitial pulmonary opacity",
+        ],
+        "morphology": [
+            "mild interstitial pulmonary edema pattern",
+        ],
+    },
+    "Pleural Effusion": {
+        "impression": [
+            "small pleural effusion",
+            "small bilateral pleural effusions",
+        ],
+        "finding": [
+            "trace pleural fluid",
+            "blunting of the costophrenic angles from pleural fluid",
+        ],
+        "anatomy": [
+            "small left pleural effusion",
+            "small bilateral pleural effusions with blunted costophrenic angles",
+        ],
+        "morphology": [
+            "small layering pleural fluid opacity",
+        ],
+    },
+}
+PROMPT_BUCKET_TEMPLATES_V2 = {
+    "impression": [
+        "Impression: {phrase}.",
+    ],
+    "finding": [
+        "Chest radiograph shows {phrase}.",
+    ],
+    "anatomy": [
+        "{phrase}.",
+    ],
+    "morphology": [
+        "Imaging shows {phrase}.",
+    ],
+    "severity": [
+        "Findings are consistent with {phrase}.",
+    ],
+}
+PROMPT_BUCKET_TEMPLATES_REPORT = {
+    "impression": [
+        "Impression: {phrase}.",
+    ],
+    "finding": [
+        "Findings: {phrase}.",
+    ],
+    "anatomy": [
+        "{phrase}.",
+    ],
+    "morphology": [
+        "Chest radiograph demonstrates {phrase}.",
+    ],
+}
+DEFAULT_PROMPT_BUCKET_PRIORS = {
+    "impression": 1.00,
+    "finding": 1.15,
+    "anatomy": 1.10,
+    "morphology": 1.10,
+    "severity": 0.95,
+    "context": 0.80,
+}
+PROMPT_BANK_PROFILE_BUCKET_ORDER = {
+    "v1": list(PROMPT_BUCKET_ORDER),
+    "v2": ["impression", "finding", "anatomy", "morphology", "severity"],
+    "v3": ["legacy", "impression", "finding", "anatomy", "morphology", "severity"],
+    "visual": ["impression", "finding", "anatomy", "morphology", "severity"],
+    "report": ["impression", "finding", "anatomy", "morphology"],
+}
+PROMPT_BANK_PROFILE_BUCKET_TEMPLATES = {
+    "v1": PROMPT_BUCKET_TEMPLATES_V1,
+    "v2": PROMPT_BUCKET_TEMPLATES_V2,
+    "v3": PROMPT_BUCKET_TEMPLATES_V2,
+    "visual": PROMPT_BUCKET_TEMPLATES_V2,
+    "report": PROMPT_BUCKET_TEMPLATES_REPORT,
+}
+PROMPT_BANK_PROFILE_PHRASE_BANK = {
+    "v1": STRUCTURED_PROMPT_PHRASE_BANK_CHEXPERT5,
+    "v2": STRUCTURED_PROMPT_PHRASE_BANK_CHEXPERT5_V2,
+    "v3": STRUCTURED_PROMPT_PHRASE_BANK_CHEXPERT5_V2,
+    "visual": STRUCTURED_PROMPT_PHRASE_BANK_CHEXPERT5_V2,
+    "report": STRUCTURED_PROMPT_PHRASE_BANK_CHEXPERT5_REPORT,
+}
+PROMPT_BANK_PROFILE_PRIORS = {
+    "v1": dict(DEFAULT_PROMPT_BUCKET_PRIORS),
+    "v2": {
+        "impression": 1.20,
+        "finding": 1.20,
+        "anatomy": 1.05,
+        "morphology": 1.00,
+        "severity": 0.70,
+    },
+    "v3": {
+        "legacy": 1.35,
+        "impression": 1.10,
+        "finding": 1.10,
+        "anatomy": 0.95,
+        "morphology": 0.90,
+        "severity": 0.65,
+    },
+    "visual": {
+        "impression": 1.15,
+        "finding": 1.20,
+        "anatomy": 1.05,
+        "morphology": 1.00,
+        "severity": 0.65,
+    },
+    "report": {
+        "impression": 1.30,
+        "finding": 1.15,
+        "anatomy": 1.00,
+        "morphology": 0.85,
+    },
+}
+PROMPT_CLASS_MIX_PROFILE_MAP = {
+    "none": {},
+    "cxr_conservative": {
+        "Atelectasis": 0.18,
+        "Cardiomegaly": 0.05,
+        "Consolidation": 0.30,
+        "Edema": 0.06,
+        "Pleural Effusion": 0.22,
+    },
+    "mimic_hybrid": {
+        "Atelectasis": 0.30,
+        "Cardiomegaly": 0.05,
+        "Consolidation": 0.16,
+        "Edema": 0.05,
+        "Pleural Effusion": 0.28,
+    },
+}
 BINARY_POSITIVE_CLASS_MAP_14 = {
     "default": ["Pneumonia"],
     "COVID": ["Pneumonia"],
@@ -141,9 +614,9 @@ class CAPA5Config:
     
     TEST_DATA_PATHS: Dict[str, str] = field(default_factory=lambda: {
         "CheXpert": str(DEFAULT_DATA_DIR / "raw_data" / "CheXpert-v1.0-small"),
-        "MIMIC": str(DEFAULT_DATA_DIR / "MIMIC_200x5.pkl"),
-        "COVID": str(DEFAULT_DATA_DIR / "raw_data" / "COVID19-Radiography-Database"),
-        "RSNA": str(DEFAULT_DATA_DIR / "raw_data" / "rsna"),
+        "MIMIC":    str(DEFAULT_DATA_DIR / "MIMIC_200x5.pkl"),
+        "COVID":    str(DEFAULT_DATA_DIR / "raw_data" / "COVID19-Radiography-Database"),
+        "RSNA":     str(DEFAULT_DATA_DIR / "raw_data" / "rsna"),
     })
     PARAM_PROFILE: str = "default"
     LABEL_SPACE: str = "chexpert5"
@@ -158,6 +631,20 @@ class CAPA5Config:
     # === Warm-up ===
     WARMUP_BATCHES: int = 50        
     M: int = 5
+    ENABLE_STRUCTURED_PROMPT_BANK: bool = False
+    PROMPT_BANK_PROFILE: str = "v3"
+    PROMPT_POOLING_MODE: str = "mean"  # mean | bucketed
+    PROMPT_LEGACY_MIX: float = 0.0
+    PROMPT_CLASS_MIX_PROFILE: str = "none"
+    ENABLE_PROMPT_CORESET: bool = False
+    PROMPT_CORESET_SIZE: int = 5
+    PROMPT_BUCKET_KEEP: int = 2
+    PROMPT_RESOURCE_MAX_CANDIDATES: int = 24
+    PROMPT_SCORE_TEMP: float = 0.12
+    PROMPT_BUCKET_SCORE_TEMP: float = 0.18
+    PROMPT_BUCKET_PRIORS: Dict[str, float] = field(default_factory=lambda: dict(DEFAULT_PROMPT_BUCKET_PRIORS))
+    SITE_EXPERT_UNKNOWN_LOW_CONF: float = 0.60
+    SITE_EXPERT_UNKNOWN_CONF_MARGIN: float = 0.0
     USE_ZCA_WHITEN: bool = False
 
 
@@ -177,12 +664,28 @@ class CAPA5Config:
     GO_PSI_EVAL_EVERY: int = 1
     # Stage-2 (CUSUM/Page-Hinkley) kept optional; not enabled by default.
     ENABLE_GO_GUARDIAN_STAGE2: bool = False
+    GO_STAGE2_DELTA: float = 0.01
+    GO_STAGE2_LAMBDA: float = 0.08
+    GO_STAGE2_MIN_STEPS: int = 3
 
     ENABLE_GO_MULTILABEL_PROJECTION: bool = True
     GO_ML_TAU_BASE: float = 1e-2
     GO_ML_COND_TARGET: float = 1e3
     GO_ML_USE_RESIDUAL_NORM_WEIGHT: bool = True
-    GO_ML_SIGNAL_USE_ORIGINAL: bool = True
+    GO_ML_SIGNAL_MODE: str = "residual"  # original | residual | adaptive
+    GO_ML_SIGNAL_USE_ORIGINAL: bool = False
+    GO_ML_ADAPTIVE_MIN_RESID_RATIO: float = 0.15
+    GO_ML_CONFOUNDER_MODE: str = "full"  # full | topm | sim_weighted
+    GO_ML_TOPM: int = 1
+    GO_ML_SIM_WEIGHT_TEMP: float = 0.20
+    GO_ML_ROBUST_MODE: str = "none"  # none | huber
+    GO_ML_HUBER_DELTA: float = 0.20
+    GO_ML_HUBER_SCOPE: str = "always"  # always | conditional | warmup
+    GO_ML_HUBER_COND_MIN_ACTIVE: int = 3
+    GO_ML_HUBER_COND_MIN_COND: float = 25.0
+    GO_ML_HUBER_COND_MIN_RESID_RATIO: float = 0.90
+    GO_ML_HUBER_COND_MIN_OTHER_SIM: float = 0.35
+    GO_ML_HUBER_WARMUP_STEPS: int = 50
 
     # === Procrustes & Gating ===
     KAPPA0: float = 0.0
@@ -231,7 +734,11 @@ class CAPA5Config:
     CAPA_BASELINE_FUSION_LAMBDA: float = 1.0
     CAPAV1_DUALTRACK_CONF_MARGIN: float = 0.02
     CAPAV1_DUALTRACK_BLEND: float = 0.65
+    CAPAV1_DUALTRACK_ENABLE_ABSTAIN: bool = False
+    CAPAV1_DUALTRACK_ABSTAIN_CONF: float = 0.60
     CAPAV1_GUARDED_ALPHAS: List[float] = field(default_factory=lambda: [1.0, 0.85, 0.70, 0.55, 0.40, 0.25])
+    ENABLE_CAPAV1_GUARDED_SLERP: bool = False
+    CAPAV1_GUARDED_SLERP_LAMBDA_MAX: float = 0.10
     CAPAV1_SOFT_FALLBACK_MIN_GAIN: float = 0.03
     CAPAV1_SOFT_FALLBACK_OFFDIAG_MULT: float = 1.50
     CAPAV1_GUARDED_DUMP: bool = False
@@ -312,6 +819,59 @@ class CAPA5Config:
         if cache_mode not in ("off", "gated"):
             raise ValueError(f"Unsupported CACHE_MODE={self.CACHE_MODE}. Use 'off' or 'gated'.")
         self.CACHE_MODE = cache_mode
+        prompt_pooling = str(getattr(self, "PROMPT_POOLING_MODE", "mean")).strip().lower()
+        if prompt_pooling not in ("mean", "bucketed"):
+            raise ValueError(f"Unsupported PROMPT_POOLING_MODE={self.PROMPT_POOLING_MODE}. Use 'mean' or 'bucketed'.")
+        self.PROMPT_POOLING_MODE = prompt_pooling
+        prompt_bank_profile = str(getattr(self, "PROMPT_BANK_PROFILE", "v2")).strip().lower()
+        if prompt_bank_profile not in PROMPT_BANK_PROFILE_BUCKET_ORDER:
+            raise ValueError(f"Unsupported PROMPT_BANK_PROFILE={self.PROMPT_BANK_PROFILE}. Use one of {list(PROMPT_BANK_PROFILE_BUCKET_ORDER.keys())}.")
+        self.PROMPT_BANK_PROFILE = prompt_bank_profile
+        self.PROMPT_LEGACY_MIX = min(1.0, max(0.0, float(getattr(self, "PROMPT_LEGACY_MIX", 0.0))))
+        prompt_class_mix_profile = str(getattr(self, "PROMPT_CLASS_MIX_PROFILE", "none")).strip().lower()
+        if prompt_class_mix_profile not in PROMPT_CLASS_MIX_PROFILE_MAP:
+            raise ValueError(f"Unsupported PROMPT_CLASS_MIX_PROFILE={self.PROMPT_CLASS_MIX_PROFILE}. Use one of {list(PROMPT_CLASS_MIX_PROFILE_MAP.keys())}.")
+        self.PROMPT_CLASS_MIX_PROFILE = prompt_class_mix_profile
+        self.PROMPT_BUCKET_KEEP = max(1, int(getattr(self, "PROMPT_BUCKET_KEEP", 2)))
+        self.PROMPT_CORESET_SIZE = max(1, int(getattr(self, "PROMPT_CORESET_SIZE", self.M)))
+        self.PROMPT_RESOURCE_MAX_CANDIDATES = max(
+            1,
+            int(getattr(self, "PROMPT_RESOURCE_MAX_CANDIDATES", 24)),
+        )
+        self.PROMPT_SCORE_TEMP = max(1e-3, float(getattr(self, "PROMPT_SCORE_TEMP", 0.12)))
+        self.PROMPT_BUCKET_SCORE_TEMP = max(1e-3, float(getattr(self, "PROMPT_BUCKET_SCORE_TEMP", 0.18)))
+        priors = dict(PROMPT_BANK_PROFILE_PRIORS.get(self.PROMPT_BANK_PROFILE, DEFAULT_PROMPT_BUCKET_PRIORS))
+        priors.update(dict(getattr(self, "PROMPT_BUCKET_PRIORS", {})))
+        self.PROMPT_BUCKET_PRIORS = {str(k): float(v) for k, v in priors.items()}
+
+        go_ml_signal_mode = str(getattr(self, "GO_ML_SIGNAL_MODE", "")).strip().lower()
+        if not go_ml_signal_mode:
+            go_ml_signal_mode = "original" if bool(getattr(self, "GO_ML_SIGNAL_USE_ORIGINAL", False)) else "residual"
+        if go_ml_signal_mode not in ("original", "residual", "adaptive"):
+            raise ValueError("Unsupported GO_ML_SIGNAL_MODE. Use 'original', 'residual', or 'adaptive'.")
+        self.GO_ML_SIGNAL_MODE = go_ml_signal_mode
+        self.GO_ML_SIGNAL_USE_ORIGINAL = bool(go_ml_signal_mode == "original")
+        conf_mode = str(getattr(self, "GO_ML_CONFOUNDER_MODE", "full")).strip().lower()
+        if conf_mode not in ("full", "topm", "sim_weighted"):
+            raise ValueError("Unsupported GO_ML_CONFOUNDER_MODE. Use 'full', 'topm', or 'sim_weighted'.")
+        self.GO_ML_CONFOUNDER_MODE = conf_mode
+        self.GO_ML_TOPM = max(1, int(getattr(self, "GO_ML_TOPM", 1)))
+        self.GO_ML_SIM_WEIGHT_TEMP = max(1e-3, float(getattr(self, "GO_ML_SIM_WEIGHT_TEMP", 0.20)))
+        robust_mode = str(getattr(self, "GO_ML_ROBUST_MODE", "none")).strip().lower()
+        if robust_mode not in ("none", "huber"):
+            raise ValueError("Unsupported GO_ML_ROBUST_MODE. Use 'none' or 'huber'.")
+        self.GO_ML_ROBUST_MODE = robust_mode
+        self.GO_ML_HUBER_DELTA = max(1e-4, float(getattr(self, "GO_ML_HUBER_DELTA", 0.20)))
+        huber_scope = str(getattr(self, "GO_ML_HUBER_SCOPE", "always")).strip().lower()
+        if huber_scope not in ("always", "conditional", "warmup"):
+            raise ValueError("Unsupported GO_ML_HUBER_SCOPE. Use 'always', 'conditional', or 'warmup'.")
+        self.GO_ML_HUBER_SCOPE = huber_scope
+        self.GO_ML_HUBER_COND_MIN_ACTIVE = max(2, int(getattr(self, "GO_ML_HUBER_COND_MIN_ACTIVE", 3)))
+        self.GO_ML_HUBER_COND_MIN_COND = max(1.0, float(getattr(self, "GO_ML_HUBER_COND_MIN_COND", 25.0)))
+        self.GO_ML_HUBER_COND_MIN_RESID_RATIO = min(1.0, max(0.0, float(getattr(self, "GO_ML_HUBER_COND_MIN_RESID_RATIO", 0.90))))
+        self.GO_ML_HUBER_COND_MIN_OTHER_SIM = min(1.0, max(0.0, float(getattr(self, "GO_ML_HUBER_COND_MIN_OTHER_SIM", 0.35))))
+        self.GO_ML_HUBER_WARMUP_STEPS = max(0, int(getattr(self, "GO_ML_HUBER_WARMUP_STEPS", int(self.WARMUP_BATCHES))))
+        self.GO_ML_ADAPTIVE_MIN_RESID_RATIO = min(1.0, max(0.0, float(getattr(self, "GO_ML_ADAPTIVE_MIN_RESID_RATIO", 0.15))))
 
         self.ENABLE_GO_GUARDIAN = True
         self.GATE_REQUIRE_OFFDIAG_IMPROVEMENT = True
@@ -397,6 +957,8 @@ class CAPA5NotebookRunner:
         self.s_opt = self.config.INIT_SCALE_FACTOR
         self.t_raw_pooled = None
         self.t_raw_pooled_raw = None  # store unwhitened text prototypes for raw-space geometry reporting
+        self.t_zero_shot_base = None
+        self.t_zero_shot_base_raw = None
         self.t_align_base = None
         self.t_paraphrases = []
         self.current_R = None; self.image_centroids = None
@@ -409,6 +971,7 @@ class CAPA5NotebookRunner:
         self.cache_reference = None
         self.cache_reference_ready = False
         self.last_cache_eval_info = {}
+        self.last_dualtrack_eval_info = {}
         self.final_alignment_stats = {}
         self.max_leverage_info = "N/A"
         self.R_last_good = None
@@ -425,6 +988,10 @@ class CAPA5NotebookRunner:
         self.guardian_psi_bin_edges: Optional[np.ndarray] = None
         self.guardian_baseline_values: List[float] = []
         self.guardian_window_values: List[float] = []
+        self.guardian_stage2_ref_mean = np.nan
+        self.guardian_stage2_stat = 0.0
+        self.guardian_stage2_last = np.nan
+        self.guardian_stage2_steps = 0
 
         # GO multi-label tau cache by active-label cardinality.
         self.go_ml_tau_cache: Dict[int, float] = {}
@@ -627,6 +1194,313 @@ class CAPA5NotebookRunner:
             z_centered = torch.matmul(z_centered, self.W_zca)
         return self._l2_norm(z_centered)
 
+    def _select_prompt_coreset_indices(self, embeds: torch.Tensor, k: int) -> List[int]:
+        n = int(embeds.shape[0])
+        k = max(1, min(int(k), n))
+        if k >= n:
+            return list(range(n))
+        sims_to_mean = torch.matmul(embeds, embeds.mean(dim=0, keepdim=True).T).squeeze(1)
+        first = int(torch.argmax(sims_to_mean).item())
+        selected = [first]
+        min_dist = 1.0 - torch.matmul(embeds, embeds[first].view(-1, 1)).squeeze(1)
+        for _ in range(1, k):
+            next_idx = int(torch.argmax(min_dist).item())
+            if next_idx in selected:
+                break
+            selected.append(next_idx)
+            cand_dist = 1.0 - torch.matmul(embeds, embeds[next_idx].view(-1, 1)).squeeze(1)
+            min_dist = torch.minimum(min_dist, cand_dist)
+        while len(selected) < k:
+            for idx in range(n):
+                if idx not in selected:
+                    selected.append(idx)
+                if len(selected) >= k:
+                    break
+        return selected[:k]
+
+    def _get_prompt_bank_profile(self) -> str:
+        return str(getattr(self.config, "PROMPT_BANK_PROFILE", "v2")).strip().lower()
+
+    def _get_prompt_bucket_order(self) -> List[str]:
+        profile = self._get_prompt_bank_profile()
+        return list(PROMPT_BANK_PROFILE_BUCKET_ORDER.get(profile, PROMPT_BUCKET_ORDER))
+
+    def _get_prompt_bucket_templates(self) -> Dict[str, List[str]]:
+        profile = self._get_prompt_bank_profile()
+        return dict(PROMPT_BANK_PROFILE_BUCKET_TEMPLATES.get(profile, PROMPT_BUCKET_TEMPLATES_V1))
+
+    def _get_prompt_bucket_priors(self) -> Dict[str, float]:
+        priors = dict(PROMPT_BANK_PROFILE_PRIORS.get(self._get_prompt_bank_profile(), DEFAULT_PROMPT_BUCKET_PRIORS))
+        priors.update(dict(getattr(self.config, "PROMPT_BUCKET_PRIORS", {})))
+        return priors
+
+    def _get_prompt_class_mix(self, cls_name: str, default_mix: float) -> float:
+        profile = str(getattr(self.config, "PROMPT_CLASS_MIX_PROFILE", "none")).strip().lower()
+        overrides = dict(PROMPT_CLASS_MIX_PROFILE_MAP.get(profile, {}))
+        if cls_name in overrides:
+            return float(overrides[cls_name])
+        return float(default_mix)
+
+    def _build_flat_prompt_entries_for_class(self, cls_name: str) -> List[Dict[str, str]]:
+        syns = list(self.config.MEDICAL_SYNONYM_MAP.get(cls_name, [cls_name]))
+        templates = list(self.config.TEMPLATES_PI)
+        target_m = max(1, int(self.config.M))
+        if not bool(getattr(self.config, "ENABLE_PROMPT_CORESET", False)):
+            cls_texts = [
+                templates[i % len(templates)].replace("{finding}", syns[i % len(syns)])
+                for i in range(target_m)
+            ]
+            return [{"bucket": "flat", "text": text} for text in cls_texts]
+
+        candidate_texts: List[str] = []
+        for template in templates:
+            for syn in syns:
+                candidate_texts.append(template.replace("{finding}", syn))
+        seen = set()
+        deduped = []
+        for text in candidate_texts:
+            if text not in seen:
+                seen.add(text)
+                deduped.append(text)
+        max_candidates = max(target_m, int(getattr(self.config, "PROMPT_RESOURCE_MAX_CANDIDATES", 24)))
+        deduped = deduped[:max_candidates]
+        return [{"bucket": "flat", "text": text} for text in deduped]
+
+    def _build_legacy_baseline_entries_for_class(self, cls_name: str) -> List[Dict[str, str]]:
+        syns = list(self.config.MEDICAL_SYNONYM_MAP.get(cls_name, [cls_name]))
+        templates = list(self.config.TEMPLATES_PI)
+        target_m = max(1, int(self.config.M))
+        cls_texts = [
+            templates[i % len(templates)].replace("{finding}", syns[i % len(syns)])
+            for i in range(target_m)
+        ]
+        return [{"bucket": "flat", "text": text} for text in cls_texts]
+
+    def _get_structured_prompt_phrases(self, cls_name: str) -> Dict[str, List[str]]:
+        label_space = str(getattr(self.config, "LABEL_SPACE", ""))
+        bank_lookup = PROMPT_BANK_PROFILE_PHRASE_BANK.get(self._get_prompt_bank_profile(), STRUCTURED_PROMPT_PHRASE_BANK_CHEXPERT5)
+        bucket_order = self._get_prompt_bucket_order()
+        if label_space == "chexpert5" and cls_name in bank_lookup:
+            bank = {}
+            for bucket in bucket_order:
+                if bucket == "legacy":
+                    continue
+                vals = list(bank_lookup[cls_name].get(bucket, []))
+                if vals:
+                    bank[bucket] = vals
+            return bank
+
+        syns = list(self.config.MEDICAL_SYNONYM_MAP.get(cls_name, [cls_name]))
+        base = syns[0]
+        bank: Dict[str, List[str]] = {
+            "impression": [base],
+            "finding": syns[: max(1, min(3, len(syns)))],
+            "anatomy": [f"{base} on chest radiograph"],
+            "morphology": [base],
+            "severity": [f"mild {base}", f"moderate {base}"],
+            "context": [f"frontal chest radiograph shows {base}"],
+        }
+        return bank
+
+    def _build_prompt_bank_entries_for_class(self, cls_name: str) -> List[Dict[str, str]]:
+        target_m = max(1, int(self.config.M))
+        entries: List[Dict[str, str]] = []
+
+        if not bool(getattr(self.config, "ENABLE_STRUCTURED_PROMPT_BANK", False)):
+            return self._build_flat_prompt_entries_for_class(cls_name)
+
+        phrase_bank = self._get_structured_prompt_phrases(cls_name)
+        bucket_order = self._get_prompt_bucket_order()
+        bucket_templates = self._get_prompt_bucket_templates()
+        seen = set()
+        if self._get_prompt_bank_profile() == "v3":
+            syns = list(self.config.MEDICAL_SYNONYM_MAP.get(cls_name, [cls_name]))
+            for template in list(self.config.TEMPLATES_PI):
+                for syn in syns:
+                    text = template.replace("{finding}", syn)
+                    if text in seen:
+                        continue
+                    seen.add(text)
+                    entries.append({"bucket": "legacy", "text": text})
+        for bucket in bucket_order:
+            if bucket == "legacy":
+                continue
+            phrases = list(phrase_bank.get(bucket, []))
+            templates = list(bucket_templates.get(bucket, ["{phrase}"]))
+            for phrase in phrases:
+                for template in templates:
+                    text = template.replace("{phrase}", phrase)
+                    if text in seen:
+                        continue
+                    seen.add(text)
+                    entries.append({"bucket": bucket, "text": text})
+
+        max_candidates = max(target_m, int(getattr(self.config, "PROMPT_RESOURCE_MAX_CANDIDATES", 24)))
+        if len(entries) > max_candidates:
+            clipped: List[Dict[str, str]] = []
+            per_bucket_cap = max(1, int(np.ceil(max_candidates / max(1, len(bucket_order)))))
+            bucket_counts = {bucket: 0 for bucket in bucket_order}
+            for item in entries:
+                bucket = str(item["bucket"])
+                if bucket_counts.get(bucket, 0) >= per_bucket_cap:
+                    continue
+                clipped.append(item)
+                bucket_counts[bucket] = bucket_counts.get(bucket, 0) + 1
+                if len(clipped) >= max_candidates:
+                    break
+            entries = clipped
+        return entries
+
+    def _select_prompt_bank_entries(
+        self,
+        entries: List[Dict[str, str]],
+        structured_bank: Optional[bool] = None,
+    ) -> Tuple[List[Dict[str, str]], torch.Tensor]:
+        texts = [str(item["text"]) for item in entries]
+        embeds = self._encode_text(texts)
+        if (not bool(getattr(self.config, "ENABLE_PROMPT_CORESET", False))) or int(embeds.shape[0]) <= 1:
+            return entries, embeds
+
+        is_structured = bool(structured_bank) if structured_bank is not None else bool(
+            any(str(item.get("bucket", "")) not in {"flat"} for item in entries)
+        )
+
+        if is_structured:
+            selected: List[int] = []
+            target_total = min(
+                int(embeds.shape[0]),
+                max(int(self.config.M), int(getattr(self.config, "PROMPT_CORESET_SIZE", self.config.M))),
+            )
+            for bucket in self._get_prompt_bucket_order():
+                idxs = [i for i, item in enumerate(entries) if str(item.get("bucket", "")) == bucket]
+                if not idxs:
+                    continue
+                local_k = min(len(idxs), int(getattr(self.config, "PROMPT_BUCKET_KEEP", 2)))
+                local_sel = self._select_prompt_coreset_indices(embeds[idxs], local_k)
+                selected.extend([idxs[j] for j in local_sel])
+            selected = list(dict.fromkeys(selected))
+            if len(selected) < target_total:
+                global_sel = self._select_prompt_coreset_indices(embeds, target_total)
+                for idx in global_sel:
+                    if idx not in selected:
+                        selected.append(idx)
+                    if len(selected) >= target_total:
+                        break
+        else:
+            coreset_k = max(1, int(getattr(self.config, "PROMPT_CORESET_SIZE", self.config.M)))
+            coreset_k = min(int(embeds.shape[0]), max(int(self.config.M), coreset_k))
+            selected = self._select_prompt_coreset_indices(embeds, coreset_k)
+
+        selected_entries = [entries[i] for i in selected]
+        selected_embeds = embeds[selected]
+        return selected_entries, selected_embeds
+
+    def _get_prompt_reference_prototypes(self, provisional_text_prototypes: torch.Tensor) -> torch.Tensor:
+        if (
+            isinstance(self.image_centroids, torch.Tensor)
+            and tuple(self.image_centroids.shape) == tuple(provisional_text_prototypes.shape)
+        ):
+            return self._l2_norm(self.image_centroids)
+        return self._l2_norm(provisional_text_prototypes)
+
+    def _prompt_margin_scores(
+        self,
+        embeds: torch.Tensor,
+        class_idx: int,
+        refs: torch.Tensor,
+    ) -> torch.Tensor:
+        sims = torch.matmul(embeds, refs.T)
+        own = sims[:, int(class_idx)]
+        if int(refs.shape[0]) <= 1:
+            return own
+        other_mask = torch.ones(int(refs.shape[0]), dtype=torch.bool, device=embeds.device)
+        other_mask[int(class_idx)] = False
+        other = sims[:, other_mask].max(dim=1).values
+        return own - other
+
+    def _pool_prompt_bank_for_class(
+        self,
+        class_idx: int,
+        entries: List[Dict[str, str]],
+        raw_embeds: torch.Tensor,
+        proc_embeds: torch.Tensor,
+        refs: torch.Tensor,
+        structured_bank: Optional[bool] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        target_m = max(1, int(self.config.M))
+        is_structured = bool(structured_bank) if structured_bank is not None else bool(
+            any(str(item.get("bucket", "")) not in {"flat"} for item in entries)
+        )
+        if (
+            (not is_structured)
+            or str(getattr(self.config, "PROMPT_POOLING_MODE", "mean")) != "bucketed"
+        ):
+            proto_raw = self._l2_norm(raw_embeds.mean(dim=0, keepdim=True)).squeeze(0)
+            proto_proc = self._l2_norm(proc_embeds.mean(dim=0, keepdim=True)).squeeze(0)
+            chosen = proc_embeds
+        else:
+            margin_scores = self._prompt_margin_scores(proc_embeds, class_idx, refs)
+            bucket_proto_raw: List[torch.Tensor] = []
+            bucket_proto_proc: List[torch.Tensor] = []
+            bucket_scores: List[torch.Tensor] = []
+            bucket_names: List[str] = []
+            bucket_order = self._get_prompt_bucket_order()
+            bucket_priors = self._get_prompt_bucket_priors()
+            prompt_combined_scores = torch.full(
+                (int(proc_embeds.shape[0]),),
+                fill_value=-1e9,
+                device=proc_embeds.device,
+            )
+            for bucket in bucket_order:
+                idxs = [i for i, item in enumerate(entries) if str(item.get("bucket", "")) == bucket]
+                if not idxs:
+                    continue
+                idx_tensor = torch.tensor(idxs, dtype=torch.long, device=proc_embeds.device)
+                local_scores = margin_scores[idx_tensor]
+                alpha = torch.softmax(local_scores / float(getattr(self.config, "PROMPT_SCORE_TEMP", 0.12)), dim=0)
+                proto_b_proc = self._l2_norm((alpha.unsqueeze(1) * proc_embeds[idx_tensor]).sum(dim=0, keepdim=True)).squeeze(0)
+                proto_b_raw = self._l2_norm((alpha.unsqueeze(1) * raw_embeds[idx_tensor]).sum(dim=0, keepdim=True)).squeeze(0)
+                score_b = self._prompt_margin_scores(proto_b_proc.view(1, -1), class_idx, refs).squeeze(0)
+                prior_b = max(1e-6, float(bucket_priors.get(bucket, 1.0)))
+                score_b = score_b + float(np.log(prior_b))
+                bucket_proto_raw.append(proto_b_raw)
+                bucket_proto_proc.append(proto_b_proc)
+                bucket_scores.append(score_b)
+                bucket_names.append(bucket)
+                prompt_combined_scores[idx_tensor] = local_scores + float(np.log(prior_b))
+
+            if not bucket_proto_proc:
+                proto_raw = self._l2_norm(raw_embeds.mean(dim=0, keepdim=True)).squeeze(0)
+                proto_proc = self._l2_norm(proc_embeds.mean(dim=0, keepdim=True)).squeeze(0)
+                chosen = proc_embeds
+            else:
+                bucket_scores_tensor = torch.stack(bucket_scores)
+                beta = torch.softmax(
+                    bucket_scores_tensor / float(getattr(self.config, "PROMPT_BUCKET_SCORE_TEMP", 0.18)),
+                    dim=0,
+                )
+                proto_raw = self._l2_norm(
+                    sum(beta[i] * bucket_proto_raw[i] for i in range(len(bucket_proto_raw))).view(1, -1)
+                ).squeeze(0)
+                proto_proc = self._l2_norm(
+                    sum(beta[i] * bucket_proto_proc[i] for i in range(len(bucket_proto_proc))).view(1, -1)
+                ).squeeze(0)
+                for i, bucket in enumerate(bucket_names):
+                    idxs = [j for j, item in enumerate(entries) if str(item.get("bucket", "")) == bucket]
+                    if idxs:
+                        idx_tensor = torch.tensor(idxs, dtype=torch.long, device=proc_embeds.device)
+                        prompt_combined_scores[idx_tensor] = prompt_combined_scores[idx_tensor] + torch.log(beta[i].clamp_min(1e-8))
+                topk = min(target_m, int(proc_embeds.shape[0]))
+                top_idx = torch.topk(prompt_combined_scores, k=topk).indices
+                chosen = proc_embeds[top_idx]
+
+        if int(chosen.shape[0]) < target_m:
+            rep_idx = [i % int(chosen.shape[0]) for i in range(target_m)]
+            chosen = chosen[rep_idx]
+        elif int(chosen.shape[0]) > target_m:
+            chosen = chosen[:target_m]
+        return proto_raw, proto_proc, chosen
+
     def _get_alignment_text_base(self) -> torch.Tensor:
         if (
             self.t_align_base is not None
@@ -639,25 +1513,159 @@ class CAPA5NotebookRunner:
 
     def _build_prototypes(self):
         classes = self.config.ORDERED_CLASS_NAMES
-        t_reshaped_list = []
+        legacy_base_raw_candidates: List[torch.Tensor] = []
         for cls_name in classes:
-            syns = self.config.MEDICAL_SYNONYM_MAP.get(cls_name, [cls_name])
-            templates = self.config.TEMPLATES_PI
-            cls_texts = [templates[i % len(templates)].replace("{finding}", syns[i % len(syns)]) for i in range(self.config.M)]
-            t_reshaped_list.append(self._encode_text(cls_texts))
-        t_reshaped = torch.stack(t_reshaped_list)  # shape [C, M, D]
+            base_entries = self._build_legacy_baseline_entries_for_class(cls_name)
+            legacy_base_raw_candidates.append(self._encode_text([str(item["text"]) for item in base_entries]))
+        self.t_zero_shot_base_raw = torch.stack(
+            [self._l2_norm(raw.mean(dim=0, keepdim=True)).squeeze(0) for raw in legacy_base_raw_candidates]
+        )
+        legacy_zT_mean = self.t_zero_shot_base_raw.mean(dim=0, keepdim=True)
+        self.t_zero_shot_base = torch.stack(
+            [
+                self._l2_norm(self._apply_preprocessing(raw, legacy_zT_mean).mean(dim=0, keepdim=True)).squeeze(0)
+                for raw in legacy_base_raw_candidates
+            ]
+        )
 
-        # 1) Raw pooled prototypes (raw space) 鈥?store for geometry reporting
-        self.t_raw_pooled_raw = self._l2_norm(t_reshaped.mean(dim=1))  # [C, D]
+        legacy_mix = float(getattr(self.config, "PROMPT_LEGACY_MIX", 0.0))
+        if bool(getattr(self.config, "ENABLE_STRUCTURED_PROMPT_BANK", False)) and legacy_mix > 0.0:
+            legacy_entries_all: List[List[Dict[str, str]]] = []
+            legacy_raw_all: List[torch.Tensor] = []
+            structured_entries_all: List[List[Dict[str, str]]] = []
+            structured_raw_all: List[torch.Tensor] = []
+            for cls_name in classes:
+                legacy_entries = self._build_flat_prompt_entries_for_class(cls_name)
+                legacy_sel_entries, legacy_sel_embeds = self._select_prompt_bank_entries(legacy_entries, structured_bank=False)
+                legacy_entries_all.append(legacy_sel_entries)
+                legacy_raw_all.append(legacy_sel_embeds)
 
-        # 2) Compute text-mean on raw pooled (this will serve as zT_mean)
-        self.zT_mean = self.t_raw_pooled_raw.mean(dim=0, keepdim=True)
+                structured_entries = self._build_prompt_bank_entries_for_class(cls_name)
+                structured_sel_entries, structured_sel_embeds = self._select_prompt_bank_entries(structured_entries, structured_bank=True)
+                structured_entries_all.append(structured_sel_entries)
+                structured_raw_all.append(structured_sel_embeds)
 
-        # 3) Now generate processed/whitened prototypes for scoring
-        t_all_flat = t_reshaped.view(-1, t_reshaped.shape[-1])
-        t_all_flat_proc = self._apply_preprocessing(t_all_flat, self.zT_mean)
-        t_reshaped_proc = t_all_flat_proc.view(len(classes), self.config.M, -1)
-        self.t_raw_pooled = self._l2_norm(t_reshaped_proc.mean(dim=1))
+            provisional_raw = torch.stack(
+                [
+                    self._l2_norm(
+                        (
+                            (1.0 - self._get_prompt_class_mix(classes[i], legacy_mix)) * legacy_raw_all[i].mean(dim=0)
+                            + self._get_prompt_class_mix(classes[i], legacy_mix) * structured_raw_all[i].mean(dim=0)
+                        ).view(1, -1)
+                    ).squeeze(0)
+                    for i in range(len(classes))
+                ]
+            )
+            self.zT_mean = provisional_raw.mean(dim=0, keepdim=True)
+
+            legacy_proc_all: List[torch.Tensor] = []
+            structured_proc_all: List[torch.Tensor] = []
+            provisional_proc_mix: List[torch.Tensor] = []
+            for i in range(len(classes)):
+                legacy_proc = self._apply_preprocessing(legacy_raw_all[i], self.zT_mean)
+                struct_proc = self._apply_preprocessing(structured_raw_all[i], self.zT_mean)
+                legacy_proc_all.append(legacy_proc)
+                structured_proc_all.append(struct_proc)
+                legacy_mean = self._l2_norm(legacy_proc.mean(dim=0, keepdim=True)).squeeze(0)
+                struct_mean = self._l2_norm(struct_proc.mean(dim=0, keepdim=True)).squeeze(0)
+                mix_w = self._get_prompt_class_mix(classes[i], legacy_mix)
+                provisional_proc_mix.append(
+                    self._l2_norm(((1.0 - mix_w) * legacy_mean + mix_w * struct_mean).view(1, -1)).squeeze(0)
+                )
+            refs = self._get_prompt_reference_prototypes(torch.stack(provisional_proc_mix))
+
+            final_raw_list: List[torch.Tensor] = []
+            final_proc_list: List[torch.Tensor] = []
+            prompt_matrix_list: List[torch.Tensor] = []
+            for class_idx in range(len(classes)):
+                mix_w = self._get_prompt_class_mix(classes[class_idx], legacy_mix)
+                legacy_raw_proto, legacy_proc_proto, legacy_chosen = self._pool_prompt_bank_for_class(
+                    class_idx,
+                    legacy_entries_all[class_idx],
+                    legacy_raw_all[class_idx],
+                    legacy_proc_all[class_idx],
+                    refs,
+                    structured_bank=False,
+                )
+                struct_raw_proto, struct_proc_proto, struct_chosen = self._pool_prompt_bank_for_class(
+                    class_idx,
+                    structured_entries_all[class_idx],
+                    structured_raw_all[class_idx],
+                    structured_proc_all[class_idx],
+                    refs,
+                    structured_bank=True,
+                )
+                final_raw = self._l2_norm(
+                    ((1.0 - mix_w) * legacy_raw_proto + mix_w * struct_raw_proto).view(1, -1)
+                ).squeeze(0)
+                final_proc = self._l2_norm(
+                    ((1.0 - mix_w) * legacy_proc_proto + mix_w * struct_proc_proto).view(1, -1)
+                ).squeeze(0)
+                final_prompts = self._l2_norm((1.0 - mix_w) * legacy_chosen + mix_w * struct_chosen)
+                final_raw_list.append(final_raw)
+                final_proc_list.append(final_proc)
+                prompt_matrix_list.append(final_prompts)
+
+            self.t_raw_pooled_raw = torch.stack(final_raw_list)
+            self.t_raw_pooled = torch.stack(final_proc_list)
+            self.t_align_base = self.t_raw_pooled.clone()
+            self.cache_keys = None
+            self.cache_labels = None
+            self.cache_is_multi = False
+            self.cache_ready = False
+            self.cache_reference = None
+            self.cache_reference_ready = False
+            self.last_cache_eval_info = {}
+            t_reshaped_proc = torch.stack(prompt_matrix_list)
+            self.t_paraphrases = [self._l2_norm(t_reshaped_proc[:, m, :]) for m in range(self.config.M)]
+            return
+
+        class_entries: List[List[Dict[str, str]]] = []
+        class_raw_candidates: List[torch.Tensor] = []
+        for cls_name in classes:
+            entries = self._build_prompt_bank_entries_for_class(cls_name)
+            sel_entries, sel_embeds = self._select_prompt_bank_entries(
+                entries,
+                structured_bank=bool(getattr(self.config, "ENABLE_STRUCTURED_PROMPT_BANK", False)),
+            )
+            class_entries.append(sel_entries)
+            class_raw_candidates.append(sel_embeds)
+
+        provisional_raw = torch.stack(
+            [
+                self._l2_norm(raw.mean(dim=0, keepdim=True)).squeeze(0)
+                for raw in class_raw_candidates
+            ]
+        )
+        self.zT_mean = provisional_raw.mean(dim=0, keepdim=True)
+
+        class_proc_candidates: List[torch.Tensor] = []
+        provisional_proc_list: List[torch.Tensor] = []
+        for raw in class_raw_candidates:
+            proc = self._apply_preprocessing(raw, self.zT_mean)
+            class_proc_candidates.append(proc)
+            provisional_proc_list.append(self._l2_norm(proc.mean(dim=0, keepdim=True)).squeeze(0))
+        provisional_proc = torch.stack(provisional_proc_list)
+        refs = self._get_prompt_reference_prototypes(provisional_proc)
+
+        final_raw_list: List[torch.Tensor] = []
+        final_proc_list: List[torch.Tensor] = []
+        prompt_matrix_list: List[torch.Tensor] = []
+        for class_idx in range(len(classes)):
+            proto_raw, proto_proc, chosen_proc = self._pool_prompt_bank_for_class(
+                class_idx,
+                class_entries[class_idx],
+                class_raw_candidates[class_idx],
+                class_proc_candidates[class_idx],
+                refs,
+                structured_bank=bool(getattr(self.config, "ENABLE_STRUCTURED_PROMPT_BANK", False)),
+            )
+            final_raw_list.append(proto_raw)
+            final_proc_list.append(proto_proc)
+            prompt_matrix_list.append(chosen_proc)
+
+        self.t_raw_pooled_raw = torch.stack(final_raw_list)
+        self.t_raw_pooled = torch.stack(final_proc_list)
         self.t_align_base = self.t_raw_pooled.clone()
         self.cache_keys = None
         self.cache_labels = None
@@ -666,6 +1674,7 @@ class CAPA5NotebookRunner:
         self.cache_reference = None
         self.cache_reference_ready = False
         self.last_cache_eval_info = {}
+        t_reshaped_proc = torch.stack(prompt_matrix_list)
         self.t_paraphrases = [self._l2_norm(t_reshaped_proc[:, m, :]) for m in range(self.config.M)]
 
     def _set_prior_bias_from_counts(self, counts: torch.Tensor):
@@ -688,6 +1697,67 @@ class CAPA5NotebookRunner:
         if n_cls is not None:
             base = base[: int(n_cls)]
         return base
+
+    def _get_alignment_class_weights(self, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        if self.support_counts is None:
+            size = len(self.config.ORDERED_CLASS_NAMES)
+            return torch.ones(size, device=self.device) / max(1, size)
+        if mask is None:
+            mask = self._get_alignment_active_mask()
+        n_cap = max(1, int(getattr(self.config, "N_CAP", 500)))
+        n_capped = torch.clamp(self.support_counts, max=float(n_cap))
+        w = (torch.pow(n_capped, self.config.GAMMA_WEIGHT) + self.config.ALPHA_WEIGHT)
+        t_ref = self._get_alignment_text_base()
+        sim = (self.image_centroids * t_ref).sum(dim=1)
+        w *= (1.0 + self.config.BETA_WEIGHT * torch.clamp(self.config.RHO - sim, min=0))
+        if mask.any():
+            w_med = torch.median(w[mask])
+            w_cap = self.config.PROCRUSTES_WEIGHT_CAP_MULT * (w_med + 1e-6)
+            w = torch.minimum(w, torch.full_like(w, w_cap))
+        w = w * mask.float()
+        return w / w.sum().clamp_min(1e-8)
+
+    def _slerp_unit(self, v0: torch.Tensor, v1: torch.Tensor, lam: float) -> torch.Tensor:
+        lam = min(1.0, max(0.0, float(lam)))
+        if lam <= 0.0:
+            return self._l2_norm(v0)
+        if lam >= 1.0:
+            return self._l2_norm(v1)
+        a = self._l2_norm(v0)
+        b = self._l2_norm(v1)
+        dot = float(torch.clamp(torch.dot(a, b), -1.0 + 1e-6, 1.0 - 1e-6).item())
+        if abs(dot) > 0.9995:
+            return self._l2_norm((1.0 - lam) * a + lam * b)
+        theta = float(np.arccos(dot))
+        sin_theta = max(np.sin(theta), 1e-6)
+        w0 = np.sin((1.0 - lam) * theta) / sin_theta
+        w1 = np.sin(lam * theta) / sin_theta
+        out = float(w0) * a + float(w1) * b
+        return self._l2_norm(out)
+
+    def _build_slerp_rotation_candidate(self, R_seed: torch.Tensor, alpha: float) -> Optional[Tuple[torch.Tensor, float]]:
+        if not bool(getattr(self.config, "ENABLE_CAPAV1_GUARDED_SLERP", False)):
+            return None
+        mask = self._get_alignment_active_mask()
+        idx = torch.where(mask)[0]
+        if int(idx.numel()) < 2:
+            return None
+        lam_max = max(0.0, float(getattr(self.config, "CAPAV1_GUARDED_SLERP_LAMBDA_MAX", 0.10)))
+        lam = min(lam_max, max(0.0, lam_max * float(alpha)))
+        if lam <= 0.0:
+            return None
+        t_base = self._get_alignment_text_base()
+        t_rot = self._l2_norm(torch.matmul(t_base, R_seed.T))
+        target = t_rot.clone()
+        mu = self._l2_norm(self.image_centroids)
+        for c_idx in idx.tolist():
+            target[c_idx] = self._slerp_unit(t_rot[c_idx], mu[c_idx], lam)
+        w = self._get_alignment_class_weights(mask)
+        base_act = t_base.index_select(0, idx)
+        target_act = target.index_select(0, idx)
+        w_act = w.index_select(0, idx)
+        m_cov = torch.matmul((w_act.view(-1, 1) * target_act).T, base_act)
+        return self._orthogonalize_rotation(m_cov), float(lam)
 
     def _snapshot_last_good_state(self) -> None:
         if isinstance(self.current_R, torch.Tensor):
@@ -804,11 +1874,53 @@ class CAPA5NotebookRunner:
         self.guardian_num_alarms = 0
         self.guardian_last_alarm_step = -1
         self.guardian_window_values = []
+        self.guardian_stage2_ref_mean = float(vals.mean()) if vals.size > 0 else np.nan
+        self.guardian_stage2_stat = 0.0
+        self.guardian_stage2_last = np.nan
+        self.guardian_stage2_steps = 0
         self._log(
             f"[GO] Baseline ready: n={int(vals.size)}, bins={n_bins}, "
             f"psi_thr={float(self.config.GO_PSI_THR):.3f}, resume={float(self.config.GO_TAU_RESUME):.3f}x{int(self.config.GO_RESUME_WINDOWS)}",
             always=True,
         )
+
+    def _guardian_batch_scalar_mean(self, probs: torch.Tensor) -> Optional[float]:
+        if probs is None or probs.numel() <= 0:
+            return None
+        scalar_name = str(getattr(self.config, "GO_GUARDIAN_SCALAR", "top1_conf")).strip().lower()
+        if scalar_name == "top1_conf":
+            vals = probs.max(dim=1).values.detach()
+        else:
+            vals = probs.max(dim=1).values.detach()
+        if vals.numel() <= 0:
+            return None
+        return float(vals.mean().item())
+
+    def _guardian_stage2_update(self, probs: torch.Tensor) -> Optional[Dict[str, float]]:
+        if not bool(getattr(self.config, "ENABLE_GO_GUARDIAN_STAGE2", False)):
+            return None
+        x = self._guardian_batch_scalar_mean(probs)
+        ref_mean = float(self.guardian_stage2_ref_mean)
+        if x is None or (not np.isfinite(ref_mean)):
+            return None
+        delta = max(0.0, float(getattr(self.config, "GO_STAGE2_DELTA", 0.01)))
+        alarm_lambda = max(1e-6, float(getattr(self.config, "GO_STAGE2_LAMBDA", 0.08)))
+        min_steps = max(1, int(getattr(self.config, "GO_STAGE2_MIN_STEPS", 3)))
+        # Detect downward confidence drift relative to baseline mean.
+        drift = max(0.0, ref_mean - x - delta)
+        self.guardian_stage2_stat = max(0.0, float(self.guardian_stage2_stat) + drift)
+        self.guardian_stage2_last = float(self.guardian_stage2_stat)
+        self.guardian_stage2_steps += 1
+        alarm = (self.guardian_stage2_steps >= min_steps) and (self.guardian_stage2_stat > alarm_lambda)
+        if not alarm and x >= (ref_mean - delta):
+            self.guardian_stage2_stat *= 0.5
+            self.guardian_stage2_last = float(self.guardian_stage2_stat)
+        return {
+            "stat": float(self.guardian_stage2_last),
+            "ref_mean": ref_mean,
+            "batch_mean": float(x),
+            "alarm": bool(alarm),
+        }
 
     def _guardian_collect_batch_scalars(self, probs: torch.Tensor):
         if (not self._is_go_guardian_enabled()) or probs is None:
@@ -884,6 +1996,8 @@ class CAPA5NotebookRunner:
             return None
 
         psi = float(psi)
+        stage2_info = self._guardian_stage2_update(probs)
+        stage2_alarm = bool(stage2_info.get("alarm", False)) if isinstance(stage2_info, dict) else False
         self.guardian_last_psi = psi
         self.guardian_psi_history.append(psi)
         changed = False
@@ -893,7 +2007,7 @@ class CAPA5NotebookRunner:
         resume_windows = max(1, int(getattr(self.config, "GO_RESUME_WINDOWS", 3)))
 
         if self.guardian_status == "normal":
-            if psi > psi_thr:
+            if (psi > psi_thr) or stage2_alarm:
                 self.guardian_last_alarm_step = int(step)
                 self.guardian_num_alarms += 1
                 self.guardian_resume_streak = 0
@@ -926,6 +2040,8 @@ class CAPA5NotebookRunner:
             "changed": bool(changed),
             "frozen": bool(self._guardian_is_frozen()),
             "dry_run": bool(dry_run),
+            "stage2_stat": float(stage2_info.get("stat", np.nan)) if isinstance(stage2_info, dict) else np.nan,
+            "stage2_alarm": bool(stage2_alarm),
         }
 
     def _resolve_scoring_mode(self, scoring_mode: Optional[str] = None) -> str:
@@ -988,6 +2104,16 @@ class CAPA5NotebookRunner:
             "tau_sim": np.nan,
             "tau_purity": np.nan,
             "tau_entropy": np.nan,
+        }
+
+    def _default_dualtrack_eval_info(self) -> Dict[str, float]:
+        return {
+            "enabled": bool(self._uses_dual_track_inference()),
+            "aligned_rate": np.nan,
+            "agree_rate": np.nan,
+            "abstain_rate": 0.0,
+            "conf_aligned_mean": np.nan,
+            "conf_raw_mean": np.nan,
         }
 
     def _labels_to_cache_matrix(
@@ -1306,6 +2432,7 @@ class CAPA5NotebookRunner:
         scale: float,
         baseline_t_protos: Optional[torch.Tensor],
     ) -> torch.Tensor:
+        self.last_dualtrack_eval_info = self._default_dualtrack_eval_info()
         if baseline_t_protos is None:
             return logits_aligned
         logits_raw = scale * torch.matmul(z_embed, baseline_t_protos.T) + self.b_c
@@ -1320,6 +2447,11 @@ class CAPA5NotebookRunner:
         pred_raw = logits_raw[:, :n_use].argmax(dim=1)
         same_pred = pred_aligned == pred_raw
         choose_aligned = choose_aligned | (same_pred & (conf_aligned >= conf_raw))
+        abstain_mask = torch.zeros_like(choose_aligned, dtype=torch.bool)
+        if bool(getattr(self.config, "CAPAV1_DUALTRACK_ENABLE_ABSTAIN", False)):
+            abstain_thr = min(0.99, max(0.0, float(getattr(self.config, "CAPAV1_DUALTRACK_ABSTAIN_CONF", 0.60))))
+            abstain_mask = torch.maximum(conf_aligned, conf_raw) < abstain_thr
+            choose_aligned = choose_aligned & (~abstain_mask)
         blend = min(1.0, max(0.0, float(getattr(self.config, "CAPAV1_DUALTRACK_BLEND", 1.0))))
         out = logits_raw.clone()
         if blend < 1.0:
@@ -1333,6 +2465,14 @@ class CAPA5NotebookRunner:
                 out_full[:, :n_use] = blend * logits_aligned[:, :n_use] + (1.0 - blend) * logits_raw[:, :n_use]
             out_full[~choose_aligned, :n_use] = logits_raw[~choose_aligned, :n_use]
             out = out_full
+        self.last_dualtrack_eval_info = {
+            "enabled": True,
+            "aligned_rate": float(choose_aligned.float().mean().item()),
+            "agree_rate": float(same_pred.float().mean().item()),
+            "abstain_rate": float(abstain_mask.float().mean().item()),
+            "conf_aligned_mean": float(conf_aligned.mean().item()),
+            "conf_raw_mean": float(conf_raw.mean().item()),
+        }
         return out
 
     def _compose_eval_logits(
@@ -1475,28 +2615,149 @@ class CAPA5NotebookRunner:
         best_idx = int(np.argmin(score))
         return float(max(taus[best_idx], tau_floor))
 
-    def _compute_multilabel_residual(self, z_img, active_indices, target_c_idx, t_aligned):
+    def _select_residual_confounders(self, active_indices, target_c_idx, t_aligned):
         other_indices = [idx for idx in active_indices if idx != target_c_idx]
         if not other_indices:
-            return z_img, 1.0
+            return [], torch.empty(0, device=self.device), torch.empty(0, device=self.device)
 
-        T_sub = t_aligned[other_indices]
-        K = int(T_sub.shape[0])
-        G = torch.matmul(T_sub, T_sub.T)
+        target_vec = self._l2_norm(t_aligned[target_c_idx].view(1, -1)).view(-1)
+        T_other = self._l2_norm(t_aligned[other_indices])
+        sims = torch.clamp(torch.matmul(T_other, target_vec), min=-1.0, max=1.0)
+        mode = str(getattr(self.config, "GO_ML_CONFOUNDER_MODE", "full")).strip().lower()
+        if mode == "topm" and int(sims.numel()) > int(getattr(self.config, "GO_ML_TOPM", 1)):
+            m = max(1, min(int(getattr(self.config, "GO_ML_TOPM", 1)), int(sims.numel())))
+            top_idx = torch.topk(sims, k=m, largest=True).indices
+            sel_indices = [other_indices[int(i)] for i in top_idx.detach().cpu().tolist()]
+            sel_sims = sims.index_select(0, top_idx)
+            weights = torch.ones_like(sel_sims)
+            return sel_indices, sel_sims, weights
+        if mode == "sim_weighted" and int(sims.numel()) > 0:
+            temp = max(float(getattr(self.config, "GO_ML_SIM_WEIGHT_TEMP", 0.20)), 1e-3)
+            logits = torch.clamp(sims, min=0.0) / temp
+            if float(torch.max(logits).item()) <= 0.0:
+                weights = torch.ones_like(sims)
+            else:
+                weights = torch.softmax(logits, dim=0) * float(len(other_indices))
+            return other_indices, sims, weights
+        weights = torch.ones_like(sims)
+        return other_indices, sims, weights
+
+    def _compute_adaptive_residual_lambda(self, *, resid_norm_ratio: float, active_count: int, max_other_sim: float) -> float:
+        if active_count <= 1:
+            return 0.0
+        resid_ratio = min(1.0, max(0.0, float(resid_norm_ratio)))
+        sim_term = min(1.0, max(0.0, float(max_other_sim)))
+        card_term = min(1.0, max(0.0, float(active_count - 1) / 2.0))
+        if resid_ratio < float(getattr(self.config, "GO_ML_ADAPTIVE_MIN_RESID_RATIO", 0.15)) and sim_term < 0.25:
+            return 0.0
+        lam = 0.15 + 0.35 * card_term + 0.30 * sim_term + 0.20 * resid_ratio
+        return min(1.0, max(0.0, float(lam)))
+
+    def _should_use_conditional_huber(
+        self,
+        *,
+        active_count: int,
+        resid_meta: Dict[str, float],
+        step: Optional[int] = None,
+    ) -> bool:
+        n_other = int(resid_meta.get("n_other", max(0, int(active_count) - 1)))
+        if n_other <= 0 or int(active_count) <= 1:
+            return False
+        scope = str(getattr(self.config, "GO_ML_HUBER_SCOPE", "always")).strip().lower()
+        if scope == "always":
+            return True
+        if scope == "warmup":
+            return (step is not None) and (int(step) < int(getattr(self.config, "GO_ML_HUBER_WARMUP_STEPS", 0)))
+        return (
+            int(active_count) >= int(getattr(self.config, "GO_ML_HUBER_COND_MIN_ACTIVE", 3))
+            or float(resid_meta.get("cond_reg", np.nan)) >= float(getattr(self.config, "GO_ML_HUBER_COND_MIN_COND", 25.0))
+            or float(resid_meta.get("resid_norm_ratio", 0.0)) >= float(getattr(self.config, "GO_ML_HUBER_COND_MIN_RESID_RATIO", 0.90))
+            or float(resid_meta.get("max_other_sim", 0.0)) >= float(getattr(self.config, "GO_ML_HUBER_COND_MIN_OTHER_SIM", 0.35))
+        )
+
+    def _compute_robust_residual_weight(
+        self,
+        signal_vec: torch.Tensor,
+        current_mu: torch.Tensor,
+        anchor: torch.Tensor,
+        *,
+        active_count: int,
+        resid_meta: Dict[str, float],
+        step: Optional[int] = None,
+    ) -> float:
+        mode = str(getattr(self.config, "GO_ML_ROBUST_MODE", "none")).strip().lower()
+        if mode == "none":
+            return 1.0
+        if not self._should_use_conditional_huber(active_count=active_count, resid_meta=resid_meta, step=step):
+            return 1.0
+        ref_vec = self._l2_norm((0.5 * current_mu + 0.5 * anchor).view(1, -1)).view(-1)
+        signal = self._l2_norm(signal_vec.view(1, -1)).view(-1)
+        cos_val = float(torch.clamp(torch.dot(signal, ref_vec), min=-1.0, max=1.0).item())
+        dist = max(0.0, 1.0 - cos_val)
+        delta = max(1e-4, float(getattr(self.config, "GO_ML_HUBER_DELTA", 0.20)))
+        if dist <= delta:
+            return 1.0
+        return float(delta / max(dist, 1e-8))
+
+    def _compute_multilabel_residual(self, z_img, active_indices, target_c_idx, t_aligned):
+        selected_indices, sims, weights = self._select_residual_confounders(active_indices, target_c_idx, t_aligned)
+        if not selected_indices:
+            meta = {
+                "n_other": 0,
+                "n_selected": 0,
+                "max_other_sim": 0.0,
+                "mean_other_sim": 0.0,
+                "resid_norm_ratio": 1.0,
+            }
+            return z_img, 1.0, meta
+
+        T_sub = t_aligned[selected_indices]
+        if int(weights.numel()) == int(T_sub.shape[0]):
+            T_proj = weights.view(-1, 1) * T_sub
+        else:
+            T_proj = T_sub
+            weights = torch.ones(int(T_sub.shape[0]), device=self.device, dtype=T_sub.dtype)
+        K = int(T_proj.shape[0])
+        G = torch.matmul(T_proj, T_proj.T)
         use_go_ml = bool(getattr(self.config, "ENABLE_GO_MULTILABEL_PROJECTION", False))
-        tau = self._select_projection_tau(T_sub, z_img) if use_go_ml else float(self.config.MULTI_LABEL_RIDGE)
-        Reg = tau * torch.eye(K, device=self.device, dtype=T_sub.dtype)
-        rhs = torch.matmul(T_sub, z_img)
+        tau = self._select_projection_tau(T_proj, z_img) if use_go_ml else float(self.config.MULTI_LABEL_RIDGE)
+        try:
+            eigvals = torch.linalg.eigvalsh(G).real
+            lam_max = float(torch.max(eigvals).item())
+            lam_min = float(torch.min(eigvals).item())
+            cond_reg = float((lam_max + tau) / max(lam_min + tau, 1e-8))
+        except RuntimeError:
+            cond_reg = np.nan
+        Reg = tau * torch.eye(K, device=self.device, dtype=T_proj.dtype)
+        rhs = torch.matmul(T_proj, z_img)
         try:
             alpha = torch.linalg.solve(G + Reg, rhs)
         except RuntimeError:
-            return z_img, 1.0
+            meta = {
+                "n_other": int(len(active_indices) - 1),
+                "n_selected": int(len(selected_indices)),
+                "max_other_sim": float(torch.max(sims).item()) if int(sims.numel()) > 0 else 0.0,
+                "mean_other_sim": float(torch.mean(sims).item()) if int(sims.numel()) > 0 else 0.0,
+                "resid_norm_ratio": 1.0,
+                "cond_reg": cond_reg,
+            }
+            return z_img, 1.0, meta
 
-        resid_raw = z_img - torch.matmul(alpha, T_sub)
+        resid_raw = z_img - torch.matmul(alpha, T_proj)
         resid_norm = float(torch.norm(resid_raw).item())
+        z_norm = max(float(torch.norm(z_img).item()), 1e-8)
+        resid_ratio = float(min(1.0, max(0.0, resid_norm / z_norm)))
+        meta = {
+            "n_other": int(len(active_indices) - 1),
+            "n_selected": int(len(selected_indices)),
+            "max_other_sim": float(torch.max(sims).item()) if int(sims.numel()) > 0 else 0.0,
+            "mean_other_sim": float(torch.mean(sims).item()) if int(sims.numel()) > 0 else 0.0,
+            "resid_norm_ratio": resid_ratio,
+            "cond_reg": cond_reg,
+        }
         if not np.isfinite(resid_norm) or resid_norm <= 1e-8:
-            return z_img, 1.0
-        return self._l2_norm(resid_raw), resid_norm
+            return z_img, 1.0, meta
+        return self._l2_norm(resid_raw), resid_norm, meta
 
     def _labels_to_active_mask(self, y_batch, n_cls: int) -> torch.Tensor:
         y_arr = np.asarray(y_batch)
@@ -1517,6 +2778,8 @@ class CAPA5NotebookRunner:
         z_batch: torch.Tensor,
         gt_labels,
         t_aligned: torch.Tensor,
+        *,
+        step: Optional[int] = None,
     ) -> Tuple[int, int, int]:
         bsz = int(z_batch.shape[0])
         n_cls = int(t_aligned.shape[0])
@@ -1545,7 +2808,7 @@ class CAPA5NotebookRunner:
                 self.prior_counts[c_idx] += 1.0
                 support_labels += 1
                 self.support_counts[c_idx] += 1.0
-                z_resid, resid_norm = self._compute_multilabel_residual(img_vec, active_indices, c_idx, t_aligned)
+                z_resid, resid_norm, resid_meta = self._compute_multilabel_residual(img_vec, active_indices, c_idx, t_aligned)
                 eta = 1.0 / (float(self.config.KAPPA_EMA) + float(self.support_counts[c_idx].item()))
                 evidence_weight = 1.0
                 if bool(getattr(self.config, "ENABLE_GO_MULTILABEL_PROJECTION", False)) and bool(
@@ -1554,11 +2817,36 @@ class CAPA5NotebookRunner:
                     evidence_weight *= max(1e-4, float(resid_norm))
                 current_mu = self.image_centroids[c_idx]
                 anchor = t_aligned[c_idx]
+                signal_mode = str(getattr(self.config, "GO_ML_SIGNAL_MODE", "residual")).strip().lower()
                 signal_vec = img_vec
-                if bool(getattr(self.config, "ENABLE_GO_MULTILABEL_PROJECTION", False)) and not bool(
-                    getattr(self.config, "GO_ML_SIGNAL_USE_ORIGINAL", True)
-                ):
-                    signal_vec = z_resid
+                residual_lambda = 0.0
+                if bool(getattr(self.config, "ENABLE_GO_MULTILABEL_PROJECTION", False)):
+                    if signal_mode == "residual":
+                        signal_vec = z_resid
+                        residual_lambda = 1.0
+                    elif signal_mode == "adaptive":
+                        residual_lambda = self._compute_adaptive_residual_lambda(
+                            resid_norm_ratio=float(resid_meta.get("resid_norm_ratio", 0.0)),
+                            active_count=len(active_indices),
+                            max_other_sim=float(resid_meta.get("max_other_sim", 0.0)),
+                        )
+                        if residual_lambda >= 1.0 - 1e-8:
+                            signal_vec = z_resid
+                        elif residual_lambda <= 1e-8:
+                            signal_vec = img_vec
+                        else:
+                            signal_vec = self._l2_norm(
+                                ((1.0 - residual_lambda) * img_vec + residual_lambda * z_resid).view(1, -1)
+                            ).view(-1)
+                robust_scale = self._compute_robust_residual_weight(
+                    signal_vec,
+                    current_mu,
+                    anchor,
+                    active_count=len(active_indices),
+                    resid_meta=resid_meta,
+                    step=step,
+                )
+                evidence_weight *= max(1e-4, float(robust_scale))
                 kappa0 = float(self.config.KAPPA0)
                 target = (kappa0 * anchor + evidence_weight * signal_vec) / (kappa0 + evidence_weight + 1e-8)
                 self.image_centroids[c_idx] = self._l2_norm((1.0 - eta) * current_mu + eta * target)
@@ -1574,18 +2862,7 @@ class CAPA5NotebookRunner:
             return self.current_R
 
         t_ref = self._get_alignment_text_base()
-        n_cap = max(1, int(getattr(self.config, "N_CAP", 500)))
-        N_capped = torch.clamp(N, max=float(n_cap))
-        w = (torch.pow(N_capped, self.config.GAMMA_WEIGHT) + self.config.ALPHA_WEIGHT)
-        sim = (self.image_centroids * t_ref).sum(dim=1)
-        w *= (1.0 + self.config.BETA_WEIGHT * torch.clamp(self.config.RHO - sim, min=0))
-        if mask.any():
-            w_med = torch.median(w[mask])
-            w_cap = self.config.PROCRUSTES_WEIGHT_CAP_MULT * (w_med + 1e-6)
-            w = torch.minimum(w, torch.full_like(w, w_cap))
-
-        w = w * mask.float()
-        w = w / w.sum().clamp_min(1e-8)
+        w = self._get_alignment_class_weights(mask)
         mu = self._l2_norm(self.image_centroids)
         t_raw = self._l2_norm(t_ref)
         M_pos = torch.matmul((w.view(-1, 1) * mu).T, t_raw)
@@ -1902,6 +3179,24 @@ class CAPA5NotebookRunner:
             best_soft = (full_stats["score"], R_full, dict(full_stats))
         candidate_dump: List[Dict[str, float]] = [dict(full_stats)]
 
+        slerp_full = self._build_slerp_rotation_candidate(R_full, 1.0)
+        if slerp_full is not None:
+            R_slerp_full, lam_full = slerp_full
+            s_stats = self._diagnose_and_log_dynamic(R_slerp_full, step, phase=phase, emit_log=False)
+            s_stats["alpha"] = 1.0
+            s_stats["mix_base"] = "slerp"
+            s_stats["selection_mode"] = "guarded_slerp"
+            s_stats["slerp_lambda"] = float(lam_full)
+            s_stats["score"] = self._alignment_stats_score(s_stats)
+            candidate_dump.append(dict(s_stats))
+            if bool(s_stats.get("passed", False)):
+                hard_candidates.append((s_stats["score"], R_slerp_full, dict(s_stats)))
+                if (best_hard is None) or (s_stats["score"] > best_hard[0]):
+                    best_hard = (s_stats["score"], R_slerp_full, dict(s_stats))
+            if allow_soft_fallback and self._is_soft_fallback_acceptable(s_stats):
+                if (best_soft is None) or (s_stats["score"] > best_soft[0]):
+                    best_soft = (s_stats["score"], R_slerp_full, dict(s_stats))
+
         identity = torch.eye(R_full.shape[0], device=self.device, dtype=R_full.dtype)
         anchor = self.current_R if isinstance(self.current_R, torch.Tensor) and self.current_R.shape == R_full.shape else identity
         alpha_list = []
@@ -1934,6 +3229,24 @@ class CAPA5NotebookRunner:
             if allow_soft_fallback and self._is_soft_fallback_acceptable(stats):
                 if (best_soft is None) or (stats["score"] > best_soft[0]):
                     best_soft = (stats["score"], R_try, dict(stats))
+
+            slerp_try = self._build_slerp_rotation_candidate(R_try, alpha)
+            if slerp_try is not None:
+                R_slerp, lam = slerp_try
+                s_stats = self._diagnose_and_log_dynamic(R_slerp, step, phase=phase, emit_log=False)
+                s_stats["alpha"] = alpha
+                s_stats["mix_base"] = "slerp"
+                s_stats["selection_mode"] = "guarded_slerp"
+                s_stats["slerp_lambda"] = float(lam)
+                s_stats["score"] = self._alignment_stats_score(s_stats)
+                candidate_dump.append(dict(s_stats))
+                if bool(s_stats.get("passed", False)):
+                    hard_candidates.append((s_stats["score"], R_slerp, dict(s_stats)))
+                    if (best_hard is None) or (s_stats["score"] > best_hard[0]):
+                        best_hard = (s_stats["score"], R_slerp, dict(s_stats))
+                if allow_soft_fallback and self._is_soft_fallback_acceptable(s_stats):
+                    if (best_soft is None) or (s_stats["score"] > best_soft[0]):
+                        best_soft = (s_stats["score"], R_slerp, dict(s_stats))
 
         if hard_candidates:
             tol = max(0.0, float(getattr(self.config, "CAPAV1_SMALLER_ALPHA_SCORE_TOL", 0.015)))
@@ -2017,6 +3330,7 @@ class CAPA5NotebookRunner:
             "selection_mix_base": str(stats.get("mix_base", "full")),
             "selection_mode": str(stats.get("selection_mode", "full")),
             "selection_score": float(stats.get("score", 0.0)),
+            "selection_slerp_lambda": float(stats.get("slerp_lambda", 0.0)),
             "soft_fallback": bool(stats.get("soft_fallback", False)),
         }
 
@@ -2072,6 +3386,10 @@ class CAPA5NotebookRunner:
         self.guardian_psi_bin_edges = None
         self.guardian_baseline_values = []
         self.guardian_window_values = []
+        self.guardian_stage2_ref_mean = np.nan
+        self.guardian_stage2_stat = 0.0
+        self.guardian_stage2_last = np.nan
+        self.guardian_stage2_steps = 0
         saved_state = False
         best_soft_candidate_R = None
         best_soft_candidate_stats = None
@@ -2112,7 +3430,8 @@ class CAPA5NotebookRunner:
             if g_info is not None and bool(g_info.get("changed", False)):
                 if bool(g_info.get("frozen", False)):
                     self._log(
-                        f"[GO] Alarm -> freeze at step={step}, PSI={float(g_info['psi']):.4f}, rollback to R_last_good.",
+                        f"[GO] Alarm -> freeze at step={step}, PSI={float(g_info['psi']):.4f}, "
+                        f"Stage2={float(g_info.get('stage2_stat', np.nan)):.4f}, rollback to R_last_good.",
                         always=True,
                     )
                 else:
@@ -2126,6 +3445,11 @@ class CAPA5NotebookRunner:
                         f"[GO][DryRun] Alarm candidate at step={step}, PSI={float(g_info['psi']):.4f} (no freeze).",
                         always=True,
                     )
+            elif g_info is not None and bool(g_info.get("stage2_alarm", False)) and bool(getattr(self.config, "ENABLE_GO_GUARDIAN_STAGE2", False)):
+                self._log(
+                    f"[GO][Stage2] Alarm candidate at step={step}, stat={float(g_info.get('stage2_stat', np.nan)):.4f}.",
+                    always=True,
+                )
 
             if self._guardian_is_frozen():
                 n_updates, n_rejected, n_support = 0, 0, 0
@@ -2139,6 +3463,7 @@ class CAPA5NotebookRunner:
                     z_b,
                     y_b,
                     t_aligned,
+                    step=step,
                 )
                 self._set_prior_bias_from_counts(self.prior_counts)
             
@@ -2155,6 +3480,7 @@ class CAPA5NotebookRunner:
                 "REJ": f"{n_rejected}",
                 "G": str(self.guardian_status),
                 "PSI": f"{float(self.guardian_last_psi):.4f}" if np.isfinite(self.guardian_last_psi) else "NA",
+                "G2": f"{float(getattr(self, 'guardian_stage2_last', np.nan)):.4f}" if np.isfinite(float(getattr(self, 'guardian_stage2_last', np.nan))) else "NA",
             }
             
             check_gate = False
@@ -2396,6 +3722,508 @@ class CAPA5NotebookRunner:
                 pass
 
         return stats
+
+    def _compute_metrics_from_prob_arrays(
+        self,
+        y_true,
+        probs_rank,
+        probs_cal,
+        *,
+        is_multi: bool,
+    ) -> Dict[str, float]:
+        stats = {
+            "Macro-AUC": np.nan,
+            "Micro-AUC": np.nan,
+            "ECE": np.nan,
+            "Acc": 0.0,
+            "Top1_Median": 0.0,
+            "Brier": np.nan,
+        }
+        if is_multi:
+            y_arr = np.asarray(y_true)
+            s_rank = np.asarray(probs_rank, dtype=np.float64)
+            s_cal = np.asarray(probs_cal, dtype=np.float64)
+            if y_arr.ndim != 2 or s_rank.ndim != 2 or s_cal.ndim != 2:
+                return stats
+            n_use = max(1, min(y_arr.shape[1], s_rank.shape[1], s_cal.shape[1]))
+            y_eval = y_arr[:, :n_use]
+            rank_eval = s_rank[:, :n_use]
+            cal_eval = s_cal[:, :n_use]
+            aucs = []
+            for i in range(n_use):
+                if len(np.unique(y_eval[:, i])) < 2:
+                    continue
+                try:
+                    aucs.append(float(roc_auc_score(y_eval[:, i], rank_eval[:, i])))
+                except Exception:
+                    continue
+            if aucs:
+                stats["Macro-AUC"] = float(np.mean(aucs))
+            try:
+                stats["Micro-AUC"] = float(roc_auc_score(y_eval, rank_eval, average="micro"))
+            except Exception:
+                pass
+            stats["ECE"] = self._compute_ece(y_eval, cal_eval)
+            stats["Acc"] = float(f1_score(y_eval, (cal_eval > 0.5).astype(int), average="macro", zero_division=0))
+            stats["Top1_Median"] = float(np.median(cal_eval.max(axis=1)))
+            stats["Brier"] = float(np.mean((cal_eval - y_eval) ** 2))
+            return stats
+
+        y_bin = np.asarray(y_true).reshape(-1)
+        s_rank = np.asarray(probs_rank, dtype=np.float64).reshape(-1)
+        s_cal = np.asarray(probs_cal, dtype=np.float64).reshape(-1)
+        n = min(len(y_bin), len(s_rank), len(s_cal))
+        if n <= 0:
+            return stats
+        y_bin = y_bin[:n]
+        s_rank = s_rank[:n]
+        s_cal = s_cal[:n]
+        if len(np.unique(y_bin)) >= 2:
+            try:
+                auc_val = float(roc_auc_score(y_bin, s_rank))
+                stats["Macro-AUC"] = auc_val
+                stats["Micro-AUC"] = auc_val
+            except Exception:
+                pass
+        stats["ECE"] = self._compute_ece(y_bin, s_cal)
+        stats["Acc"] = float(accuracy_score(y_bin, (s_cal > 0.5).astype(int)))
+        stats["Top1_Median"] = float(np.median(s_cal))
+        stats["Brier"] = float(np.mean((s_cal - y_bin) ** 2))
+        return stats
+
+    def _load_saved_state_for_evaluation(self) -> Dict[str, object]:
+        state_path = os.path.join(self.config.SAVE_DIR, "capa_state.pkl")
+        if not os.path.exists(state_path):
+            raise FileNotFoundError(f"Missing state: {state_path}")
+
+        with open(state_path, "rb") as f:
+            state = pickle.load(f)
+
+        self.R_frozen = state["R"].to(self.device)
+        r_last_good = state.get("R_last_good", None)
+        if isinstance(r_last_good, torch.Tensor):
+            self.R_last_good = r_last_good.to(self.device)
+        else:
+            self.R_last_good = self.R_frozen.clone()
+        centroids_last_good = state.get("centroids_last_good", None)
+        self.centroids_last_good = centroids_last_good.to(self.device) if isinstance(centroids_last_good, torch.Tensor) else None
+        counts_blob = state.get("support_counts", state.get("counts"))
+        counts = counts_blob.to(self.device)
+        self.support_counts = counts.clone()
+        counts_lq = state.get("rejected_counts", state.get("counts_lq", None))
+        self.rejected_counts = counts_lq.to(self.device) if isinstance(counts_lq, torch.Tensor) else None
+        prior_counts = state.get("prior_counts", None)
+        self.prior_counts = prior_counts.to(self.device) if isinstance(prior_counts, torch.Tensor) else counts.clone()
+        if "centroids" in state and state["centroids"] is not None:
+            self.image_centroids = self._l2_norm(state["centroids"].to(self.device))
+        t_align_state = state.get("t_align_base", None)
+        if isinstance(t_align_state, torch.Tensor):
+            t_align_state = t_align_state.to(self.device)
+            if self.t_raw_pooled is not None and tuple(t_align_state.shape) == tuple(self.t_raw_pooled.shape):
+                self.t_align_base = self._l2_norm(t_align_state)
+            else:
+                self.t_align_base = None
+        else:
+            self.t_align_base = None
+        self.final_alignment_stats = state.get("alignment_stats", {})
+        self.max_leverage_info = state.get("max_leverage", "N/A")
+        guardian_state = state.get("guardian", {}) or {}
+        self.guardian_status = str(guardian_state.get("status", "normal"))
+        self.guardian_last_alarm_step = int(guardian_state.get("last_alarm_step", -1))
+        self.guardian_num_alarms = int(guardian_state.get("num_alarms", 0))
+        self.guardian_last_psi = float(guardian_state.get("last_psi", np.nan))
+        self.guardian_psi_history = [float(x) for x in list(guardian_state.get("psi_history", []))]
+        self.guardian_psi_baseline_hist = guardian_state.get("psi_baseline_hist", None)
+        self.guardian_psi_bin_edges = guardian_state.get("psi_bin_edges", None)
+
+        if self.t_align_base is None:
+            self.t_align_base = self.t_raw_pooled.clone()
+        self._set_prior_bias_from_counts(self.prior_counts if self.prior_counts is not None else counts)
+        return state
+
+    def _predict_dataset_branch_outputs(
+        self,
+        dataset_name: str,
+        path: str,
+        *,
+        scoring_mode: Optional[str] = None,
+        split_override: int = 2,
+    ) -> Dict[str, object]:
+        if self.R_frozen is None or self.support_counts is None or self.prior_counts is None:
+            self._load_saved_state_for_evaluation()
+
+        mode = self._resolve_scoring_mode(scoring_mode)
+        t_base_proc = self.t_zero_shot_base if isinstance(self.t_zero_shot_base, torch.Tensor) else self.t_raw_pooled
+        t_align_base_proc = self._get_alignment_text_base()
+        t_capa_proc = self._l2_norm(torch.matmul(t_align_base_proc, self.R_frozen.T))
+
+        z_test_raw, y_test, is_multi = self._load_data(path, split_override=int(split_override))
+        if y_test is None:
+            raise RuntimeError(f"Dataset has no labels: {dataset_name}")
+        z_test_proc = self._apply_preprocessing(z_test_raw, self.zI_mean)
+
+        g_cpu = torch.Generator()
+        g_cpu.manual_seed(self.config.RANDOM_SEED)
+        perm = torch.randperm(len(z_test_raw), generator=g_cpu)
+        z_eval_proc = z_test_proc[perm]
+        y_eval = y_test[perm.cpu().numpy()]
+
+        z_tau_raw, y_tau, _ = self._load_data(
+            self.config.TAU_CALIB_DATA_PATH,
+            is_calibration=True,
+            split_override=1,
+        )
+        if y_tau is None:
+            raise RuntimeError(f"TAU calibration set has no labels: {self.config.TAU_CALIB_DATA_PATH}")
+        z_tau_proc = self._apply_preprocessing(z_tau_raw, self.zI_mean)
+        g_cpu_tau = torch.Generator()
+        g_cpu_tau.manual_seed(self.config.RANDOM_SEED)
+        perm_tau = torch.randperm(len(z_tau_proc), generator=g_cpu_tau)
+        z_tau_proc = z_tau_proc[perm_tau]
+        if isinstance(y_tau, np.ndarray):
+            y_tau = y_tau[perm_tau.cpu().numpy()]
+        n_tau_total = len(z_tau_proc)
+        n_tau = max(1, int(self.config.TAU_CALIB_FRAC * n_tau_total))
+        if n_tau_total >= 2500:
+            n_tau = min(self.config.TAU_CALIB_MAX, max(self.config.TAU_CALIB_MIN, n_tau))
+        z_tau_proc = z_tau_proc[:n_tau]
+        y_tau = y_tau[:n_tau]
+
+        logits_tau = self._compose_eval_logits(
+            z_tau_proc,
+            t_capa_proc,
+            scale=float(self.s_opt),
+            baseline_t_protos=t_base_proc,
+        ).cpu().numpy()
+        labels_tau = np.array(y_tau)
+        if is_multi:
+            if labels_tau.ndim != 2:
+                raise RuntimeError(f"TAU calib labels expected 2D for multilabel, got shape={labels_tau.shape}")
+            n_eval = int(y_eval.shape[1]) if getattr(y_eval, "ndim", 1) == 2 else 1
+            n_tau_labels = int(labels_tau.shape[1])
+            n_tau_logits = int(logits_tau.shape[1])
+            n_use = max(1, min(n_eval, n_tau_labels, n_tau_logits))
+            logits_tau = logits_tau[:, :n_use]
+            labels_tau = labels_tau[:, :n_use]
+        tau_cal, _ = self._fit_posthoc_tau(
+            logits_tau,
+            labels_tau,
+            dataset_name=dataset_name,
+            is_multi=is_multi,
+            scoring_mode=mode,
+        )
+
+        logits_capa = self._compose_eval_logits(
+            z_eval_proc,
+            t_capa_proc,
+            scale=float(self.s_opt),
+            baseline_t_protos=t_base_proc,
+        )
+        logits_base = float(self.s_opt) * torch.matmul(z_eval_proc, t_base_proc.T) + self.b_c
+
+        probs_capa_cal = self._predict_probs(
+            logits_capa,
+            calib_T=tau_cal,
+            is_multi=is_multi,
+            dataset_name=dataset_name,
+            scoring_mode=mode,
+            ranking=False,
+        ).detach().cpu().numpy()
+        probs_capa_rank = self._predict_probs(
+            logits_capa,
+            calib_T=1.0,
+            is_multi=is_multi,
+            dataset_name=dataset_name,
+            scoring_mode=mode,
+            ranking=True,
+        ).detach().cpu().numpy()
+        probs_base_cal = self._predict_probs(
+            logits_base,
+            calib_T=tau_cal,
+            is_multi=is_multi,
+            dataset_name=dataset_name,
+            scoring_mode=mode,
+            ranking=False,
+        ).detach().cpu().numpy()
+        probs_base_rank = self._predict_probs(
+            logits_base,
+            calib_T=1.0,
+            is_multi=is_multi,
+            dataset_name=dataset_name,
+            scoring_mode=mode,
+            ranking=True,
+        ).detach().cpu().numpy()
+
+        if is_multi:
+            n_use = max(1, min(int(y_eval.shape[1]), int(probs_capa_rank.shape[1]), int(probs_base_rank.shape[1])))
+            y_eval_use = np.asarray(y_eval)[:, :n_use]
+            probs_capa_cal_use = probs_capa_cal[:, :n_use]
+            probs_capa_rank_use = probs_capa_rank[:, :n_use]
+            probs_base_cal_use = probs_base_cal[:, :n_use]
+            probs_base_rank_use = probs_base_rank[:, :n_use]
+            conf = probs_capa_cal_use.max(axis=1)
+        else:
+            y_eval_use = np.asarray(y_eval).reshape(-1)
+            probs_capa_cal_use = np.asarray(probs_capa_cal).reshape(-1)
+            probs_capa_rank_use = np.asarray(probs_capa_rank).reshape(-1)
+            probs_base_cal_use = np.asarray(probs_base_cal).reshape(-1)
+            probs_base_rank_use = np.asarray(probs_base_rank).reshape(-1)
+            conf = probs_capa_cal_use.reshape(-1)
+
+        stats_capa = self._compute_metrics_from_prob_arrays(
+            y_eval_use,
+            probs_capa_rank_use,
+            probs_capa_cal_use,
+            is_multi=is_multi,
+        )
+        stats_base = self._compute_metrics_from_prob_arrays(
+            y_eval_use,
+            probs_base_rank_use,
+            probs_base_cal_use,
+            is_multi=is_multi,
+        )
+        return {
+            "dataset": dataset_name,
+            "is_multi": bool(is_multi),
+            "y": y_eval_use,
+            "tau_cal": float(tau_cal),
+            "probs_capa_rank": probs_capa_rank_use,
+            "probs_capa_cal": probs_capa_cal_use,
+            "probs_base_rank": probs_base_rank_use,
+            "probs_base_cal": probs_base_cal_use,
+            "confidence": np.asarray(conf, dtype=np.float64).reshape(-1),
+            "stats_capa": stats_capa,
+            "stats_base": stats_base,
+        }
+
+    def _macro_auc_subset(
+        self,
+        y_true,
+        probs_rank,
+        *,
+        is_multi: bool,
+        sample_mask: Optional[np.ndarray] = None,
+        class_indices: Optional[List[int]] = None,
+    ) -> float:
+        y_arr = np.asarray(y_true)
+        s_arr = np.asarray(probs_rank, dtype=np.float64)
+        if sample_mask is not None:
+            mask = np.asarray(sample_mask, dtype=bool).reshape(-1)
+            if y_arr.shape[0] != mask.shape[0]:
+                n = min(int(y_arr.shape[0]), int(mask.shape[0]))
+                y_arr = y_arr[:n]
+                s_arr = s_arr[:n]
+                mask = mask[:n]
+            y_arr = y_arr[mask]
+            s_arr = s_arr[mask]
+        if len(y_arr) <= 1:
+            return np.nan
+        if not is_multi:
+            y_bin = np.asarray(y_arr).reshape(-1)
+            s_bin = np.asarray(s_arr, dtype=np.float64).reshape(-1)
+            if len(np.unique(y_bin)) < 2:
+                return np.nan
+            try:
+                return float(roc_auc_score(y_bin, s_bin))
+            except Exception:
+                return np.nan
+
+        if y_arr.ndim != 2 or s_arr.ndim != 2:
+            return np.nan
+        if class_indices is None:
+            class_indices = list(range(min(int(y_arr.shape[1]), int(s_arr.shape[1]))))
+        aucs = []
+        for idx in class_indices:
+            if idx >= y_arr.shape[1] or idx >= s_arr.shape[1]:
+                continue
+            y_c = y_arr[:, idx]
+            if len(np.unique(y_c)) < 2:
+                continue
+            try:
+                aucs.append(float(roc_auc_score(y_c, s_arr[:, idx])))
+            except Exception:
+                continue
+        return float(np.mean(aucs)) if aucs else np.nan
+
+    def _compute_eval_go_ml_risk_features(
+        self,
+        z_eval: torch.Tensor,
+        y_eval,
+        t_protos: torch.Tensor,
+    ) -> pd.DataFrame:
+        n_cls = int(t_protos.shape[0])
+        active_mask = self._labels_to_active_mask(y_eval, n_cls=n_cls)
+        support_np = None
+        support_med = np.nan
+        if isinstance(self.support_counts, torch.Tensor):
+            support_np = self.support_counts.detach().cpu().numpy().astype(np.float64)
+            support_med = float(np.median(support_np)) if support_np.size > 0 else np.nan
+        rows = []
+        for i in range(int(z_eval.shape[0])):
+            active_indices = torch.where(active_mask[i])[0].tolist()
+            n_active = len(active_indices)
+            cond_vals = []
+            resid_ratio_vals = []
+            sim_vals = []
+            for c_idx in active_indices:
+                _, _, meta = self._compute_multilabel_residual(z_eval[i], active_indices, c_idx, t_protos)
+                cond_val = float(meta.get("cond_reg", np.nan))
+                ratio_val = float(meta.get("resid_norm_ratio", np.nan))
+                sim_val = float(meta.get("max_other_sim", np.nan))
+                if np.isfinite(cond_val):
+                    cond_vals.append(cond_val)
+                if np.isfinite(ratio_val):
+                    resid_ratio_vals.append(ratio_val)
+                if np.isfinite(sim_val):
+                    sim_vals.append(sim_val)
+            support_vals = [float(support_np[idx]) for idx in active_indices] if support_np is not None and active_indices else []
+            min_support = float(min(support_vals)) if support_vals else np.nan
+            rows.append(
+                {
+                    "sample_idx": i,
+                    "active_count": n_active,
+                    "cond_reg_max": float(max(cond_vals)) if cond_vals else np.nan,
+                    "resid_ratio_max": float(max(resid_ratio_vals)) if resid_ratio_vals else np.nan,
+                    "max_other_sim": float(max(sim_vals)) if sim_vals else np.nan,
+                    "min_support": min_support,
+                    "freq_bucket": (
+                        "low"
+                        if np.isfinite(min_support) and np.isfinite(support_med) and min_support < support_med
+                        else "high"
+                    ) if active_indices else "none",
+                }
+            )
+        return pd.DataFrame(rows)
+
+    def _evaluate_prompt_stage(
+        self,
+        z_test: torch.Tensor,
+        y_test,
+        is_multi: bool,
+        t_protos: torch.Tensor,
+        *,
+        dataset_name: str,
+        prior_counts: Optional[torch.Tensor] = None,
+    ) -> Tuple[Dict[str, float], np.ndarray]:
+        old_b = None if self.b_c is None else self.b_c.clone()
+        if prior_counts is None:
+            self.b_c = torch.zeros((1, int(t_protos.shape[0])), device=self.device)
+        else:
+            self._set_prior_bias_from_counts(prior_counts)
+
+        stats = self._compute_metrics(
+            z_test,
+            y_test,
+            is_multi,
+            t_protos,
+            scale_override=self.s_opt,
+            temperature_override=self.T_opt,
+            dataset_name=dataset_name,
+            scoring_mode=self._resolve_scoring_mode(None),
+            baseline_t_protos=None,
+            use_cache=False,
+        )
+        logits = self.s_opt * torch.matmul(z_test, t_protos.T) + self.b_c
+        probs_rank = self._predict_probs(
+            logits,
+            calib_T=1.0,
+            is_multi=is_multi,
+            dataset_name=dataset_name,
+            scoring_mode=self._resolve_scoring_mode(None),
+            ranking=True,
+        ).detach().cpu().numpy()
+
+        if old_b is None:
+            self.b_c = None
+        else:
+            self.b_c = old_b
+        return stats, probs_rank
+
+    def _per_class_auc_rows(
+        self,
+        y_true,
+        probs_rank: np.ndarray,
+        *,
+        dataset_name: str,
+        stage_name: str,
+    ) -> List[Dict[str, object]]:
+        y_arr = np.asarray(y_true)
+        if y_arr.ndim != 2:
+            return []
+        n_use = min(int(y_arr.shape[1]), int(probs_rank.shape[1]), len(self.config.ORDERED_CLASS_NAMES))
+        rows: List[Dict[str, object]] = []
+        for c in range(n_use):
+            y_c = y_arr[:, c]
+            auc_val = np.nan
+            if len(np.unique(y_c)) >= 2:
+                try:
+                    auc_val = float(roc_auc_score(y_c, probs_rank[:, c]))
+                except Exception:
+                    auc_val = np.nan
+            rows.append(
+                {
+                    "Dataset": dataset_name,
+                    "Stage": stage_name,
+                    "Class": str(self.config.ORDERED_CLASS_NAMES[c]),
+                    "AUC": auc_val,
+                    "Prevalence": float(np.mean(y_c)),
+                    "Positives": int(np.sum(y_c > 0)),
+                    "Negatives": int(np.sum(y_c <= 0)),
+                }
+            )
+        return rows
+
+    def _prototype_angle_deg(self, A: torch.Tensor, B: torch.Tensor) -> np.ndarray:
+        n_use = min(int(A.shape[0]), int(B.shape[0]))
+        a = self._l2_norm(A[:n_use])
+        b = self._l2_norm(B[:n_use])
+        cos = torch.clamp(torch.sum(a * b, dim=1), min=-1.0, max=1.0)
+        ang = torch.rad2deg(torch.acos(cos)).detach().cpu().numpy()
+        return np.asarray(ang, dtype=np.float64)
+
+    def _build_fixed_alignment_with_external_state(
+        self,
+        *,
+        centroids: torch.Tensor,
+        support_counts: torch.Tensor,
+        prior_counts: torch.Tensor,
+        rejected_counts: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        backup = {
+            "image_centroids": None if self.image_centroids is None else self.image_centroids.clone(),
+            "support_counts": None if self.support_counts is None else self.support_counts.clone(),
+            "prior_counts": None if self.prior_counts is None else self.prior_counts.clone(),
+            "rejected_counts": None if self.rejected_counts is None else self.rejected_counts.clone(),
+            "t_align_base": None if self.t_align_base is None else self.t_align_base.clone(),
+            "b_c": None if self.b_c is None else self.b_c.clone(),
+        }
+        try:
+            self.image_centroids = centroids.clone().to(self.device)
+            self.support_counts = support_counts.clone().to(self.device)
+            self.prior_counts = prior_counts.clone().to(self.device)
+            self.rejected_counts = (
+                rejected_counts.clone().to(self.device)
+                if isinstance(rejected_counts, torch.Tensor)
+                else torch.zeros_like(self.support_counts)
+            )
+            self.t_align_base = self.t_raw_pooled.clone()
+            self._set_prior_bias_from_counts(self.prior_counts)
+            R_full = self._solve_procrustes()
+            R_sel, stats = self._select_guarded_alignment_candidate(
+                R_full,
+                step=int(getattr(self.config, "WARMUP_BATCHES", 0)),
+                phase="PromptDiag",
+                allow_soft_fallback=True,
+            )
+            t_eval = self._l2_norm(torch.matmul(self.t_align_base, R_sel.T))
+            return t_eval, dict(stats)
+        finally:
+            self.image_centroids = backup["image_centroids"]
+            self.support_counts = backup["support_counts"]
+            self.prior_counts = backup["prior_counts"]
+            self.rejected_counts = backup["rejected_counts"]
+            self.t_align_base = backup["t_align_base"]
+            self.b_c = backup["b_c"]
 
     def _fit_posthoc_tau(
         self,
@@ -2955,7 +4783,7 @@ class CAPA5NotebookRunner:
         """Sweep over scale factors without touching routing/temperature/rotation."""
         self._log("\n[Stage IV-B] Scale Sweep (s)")
         results = []
-        t_base = self.t_raw_pooled
+        t_base = self.t_zero_shot_base if isinstance(self.t_zero_shot_base, torch.Tensor) else self.t_raw_pooled
         t_align_base = self._get_alignment_text_base()
         t_capa = self._l2_norm(torch.matmul(t_align_base, self.R_frozen.T))
 
@@ -3056,7 +4884,7 @@ class CAPA5NotebookRunner:
         self._set_prior_bias_from_counts(self.prior_counts if self.prior_counts is not None else counts)
 
         # Keep alignment-space (processed) heads for both metrics and Sim reporting.
-        t_base_proc = self.t_raw_pooled
+        t_base_proc = self.t_zero_shot_base if isinstance(self.t_zero_shot_base, torch.Tensor) else self.t_raw_pooled
         t_align_base_proc = self._get_alignment_text_base()
         t_capa_proc = self._l2_norm(torch.matmul(t_align_base_proc, self.R_frozen.T))
         gate_sim = self._compute_dataset_alignment_stats(
@@ -3202,6 +5030,7 @@ class CAPA5NotebookRunner:
                 baseline_t_protos=t_base_proc,
             )
             cache_info = dict(self.last_cache_eval_info)
+            dualtrack_info = dict(self.last_dualtrack_eval_info)
 
             auc_diff = abs(stats_post["Macro-AUC"] - stats_pre["Macro-AUC"])
             if auc_diff > 1e-5:
@@ -3296,6 +5125,21 @@ class CAPA5NotebookRunner:
                 "Cache_Alpha_Max": float(self.config.CACHE_ALPHA_MAX),
                 "Cache_TopK": int(self.config.CACHE_TOPK),
                 "Cache_Temp": float(self.config.CACHE_TEMP),
+                "Structured_Prompt_Bank": bool(getattr(self.config, "ENABLE_STRUCTURED_PROMPT_BANK", False)),
+                "Prompt_Bank_Profile": str(getattr(self.config, "PROMPT_BANK_PROFILE", "v2")),
+                "Prompt_Pooling_Mode": str(getattr(self.config, "PROMPT_POOLING_MODE", "mean")),
+                "Prompt_Legacy_Mix": float(getattr(self.config, "PROMPT_LEGACY_MIX", 0.0)),
+                "Prompt_Class_Mix_Profile": str(getattr(self.config, "PROMPT_CLASS_MIX_PROFILE", "none")),
+                "Guarded_Slerp": bool(getattr(self.config, "ENABLE_CAPAV1_GUARDED_SLERP", False)),
+                "Guarded_Slerp_Lambda_Max": float(getattr(self.config, "CAPAV1_GUARDED_SLERP_LAMBDA_MAX", 0.0)),
+                "GO_Stage2": bool(getattr(self.config, "ENABLE_GO_GUARDIAN_STAGE2", False)),
+                "Prompt_Coreset": bool(getattr(self.config, "ENABLE_PROMPT_CORESET", False)),
+                "Prompt_Coreset_Size": int(getattr(self.config, "PROMPT_CORESET_SIZE", self.config.M)),
+                "Prompt_Bucket_Keep": int(getattr(self.config, "PROMPT_BUCKET_KEEP", 2)),
+                "DualTrack_Abstain": bool(getattr(self.config, "CAPAV1_DUALTRACK_ENABLE_ABSTAIN", False)),
+                "DualTrack_Abstain_Rate": dualtrack_info.get("abstain_rate", 0.0),
+                "DualTrack_Aligned_Rate": dualtrack_info.get("aligned_rate", np.nan),
+                "DualTrack_Agree_Rate": dualtrack_info.get("agree_rate", np.nan),
                 "Cache_Dataset_Gate": bool(cache_info.get("dataset_gate", False)),
                 "Cache_PSI_Top1": cache_info.get("psi_top1", np.nan),
                 "Cache_PSI_TopKMean": cache_info.get("psi_topk_mean", np.nan),
@@ -3843,7 +5687,7 @@ class CAPA5NotebookRunner:
             status = "REJECTED (Identity)"
         self._log(f"\n[Stage IV] Evaluation ({status})")
         
-        t_base = self.t_raw_pooled
+        t_base = self.t_zero_shot_base if isinstance(self.t_zero_shot_base, torch.Tensor) else self.t_raw_pooled
         t_align_base = self._get_alignment_text_base()
         t_capa = self._l2_norm(torch.matmul(t_align_base, self.R_frozen.T))
         gate_sim = self._compute_dataset_alignment_stats(
@@ -3943,6 +5787,656 @@ def _parse_float_csv(text: Optional[str]) -> Optional[List[float]]:
     return items if items else None
 
 
+def run_prompt_stage_isolation_analysis(config: CAPA5Config) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    out_dir = os.path.join(config.SAVE_DIR, "prompt_stage_isolation")
+    os.makedirs(out_dir, exist_ok=True)
+
+    legacy_cfg = copy.deepcopy(config)
+    legacy_cfg.DEBUG = False
+    legacy_cfg.VERBOSE = False
+    legacy_cfg.PRINT_SUMMARY = False
+    legacy_cfg.CACHE_MODE = "off"
+    legacy_cfg.ENABLE_STRUCTURED_PROMPT_BANK = False
+    legacy_cfg.PROMPT_BANK_PROFILE = "v3"
+    legacy_cfg.PROMPT_POOLING_MODE = "mean"
+    legacy_cfg.PROMPT_LEGACY_MIX = 0.0
+    legacy_cfg.PROMPT_CLASS_MIX_PROFILE = "none"
+    legacy_cfg.ENABLE_PROMPT_CORESET = False
+    legacy_cfg.SAVE_DIR = os.path.join(out_dir, "legacy")
+
+    structured_cfg = copy.deepcopy(config)
+    structured_cfg.DEBUG = False
+    structured_cfg.VERBOSE = False
+    structured_cfg.PRINT_SUMMARY = False
+    structured_cfg.CACHE_MODE = "off"
+    structured_cfg.SAVE_DIR = os.path.join(out_dir, "structured")
+
+    legacy_runner = CAPA5NotebookRunner(legacy_cfg)
+    legacy_runner.run_pipeline()
+    structured_runner = CAPA5NotebookRunner(structured_cfg)
+    structured_runner.run_pipeline()
+
+    legacy_raw_t = legacy_runner.t_zero_shot_base if isinstance(legacy_runner.t_zero_shot_base, torch.Tensor) else legacy_runner.t_raw_pooled
+    legacy_full_t = legacy_runner._l2_norm(torch.matmul(legacy_runner._get_alignment_text_base(), legacy_runner.R_frozen.T))
+    structured_raw_t = structured_runner.t_raw_pooled.clone()
+    structured_fixed_t, fixed_stats = structured_runner._build_fixed_alignment_with_external_state(
+        centroids=legacy_runner.image_centroids,
+        support_counts=legacy_runner.support_counts,
+        prior_counts=legacy_runner.prior_counts,
+        rejected_counts=legacy_runner.rejected_counts,
+    )
+    structured_full_t = structured_runner._l2_norm(torch.matmul(structured_runner._get_alignment_text_base(), structured_runner.R_frozen.T))
+
+    angle_raw = legacy_runner._prototype_angle_deg(legacy_raw_t, structured_raw_t)
+    angle_fixed = legacy_runner._prototype_angle_deg(legacy_full_t, structured_fixed_t)
+    angle_full = legacy_runner._prototype_angle_deg(legacy_full_t, structured_full_t)
+
+    summary_rows: List[Dict[str, object]] = []
+    mimic_rows: List[Dict[str, object]] = []
+
+    for d_name, path in config.TEST_DATA_PATHS.items():
+        if not os.path.exists(path):
+            continue
+
+        z_legacy_raw, y_legacy, is_multi_legacy = legacy_runner._load_data(path, split_override=2)
+        if y_legacy is None:
+            continue
+        z_legacy = legacy_runner._apply_preprocessing(z_legacy_raw, legacy_runner.zI_mean)
+
+        z_struct_raw, y_struct, is_multi_struct = structured_runner._load_data(path, split_override=2)
+        z_struct = structured_runner._apply_preprocessing(z_struct_raw, structured_runner.zI_mean)
+
+        stats_legacy_raw, probs_legacy_raw = legacy_runner._evaluate_prompt_stage(
+            z_legacy, y_legacy, is_multi_legacy, legacy_raw_t, dataset_name=d_name, prior_counts=None
+        )
+        stats_legacy_full, probs_legacy_full = legacy_runner._evaluate_prompt_stage(
+            z_legacy,
+            y_legacy,
+            is_multi_legacy,
+            legacy_full_t,
+            dataset_name=d_name,
+            prior_counts=legacy_runner.prior_counts,
+        )
+        stats_struct_raw, probs_struct_raw = structured_runner._evaluate_prompt_stage(
+            z_struct, y_struct, is_multi_struct, structured_raw_t, dataset_name=d_name, prior_counts=None
+        )
+        stats_struct_fixed, probs_struct_fixed = structured_runner._evaluate_prompt_stage(
+            z_struct,
+            y_struct,
+            is_multi_struct,
+            structured_fixed_t,
+            dataset_name=d_name,
+            prior_counts=legacy_runner.prior_counts,
+        )
+        stats_struct_full, probs_struct_full = structured_runner._evaluate_prompt_stage(
+            z_struct,
+            y_struct,
+            is_multi_struct,
+            structured_full_t,
+            dataset_name=d_name,
+            prior_counts=structured_runner.prior_counts,
+        )
+
+        summary_rows.append(
+            {
+                "Dataset": d_name,
+                "Legacy_Raw_AUC_Macro": float(stats_legacy_raw.get("Macro-AUC", np.nan)),
+                "Structured_Raw_AUC_Macro": float(stats_struct_raw.get("Macro-AUC", np.nan)),
+                "Delta_Raw_vs_Legacy_Raw": float(stats_struct_raw.get("Macro-AUC", np.nan) - stats_legacy_raw.get("Macro-AUC", np.nan)),
+                "Legacy_Full_AUC_Macro": float(stats_legacy_full.get("Macro-AUC", np.nan)),
+                "Structured_Fixed_AUC_Macro": float(stats_struct_fixed.get("Macro-AUC", np.nan)),
+                "Delta_Fixed_vs_Legacy_Full": float(stats_struct_fixed.get("Macro-AUC", np.nan) - stats_legacy_full.get("Macro-AUC", np.nan)),
+                "Structured_Full_AUC_Macro": float(stats_struct_full.get("Macro-AUC", np.nan)),
+                "Delta_Full_vs_Legacy_Full": float(stats_struct_full.get("Macro-AUC", np.nan) - stats_legacy_full.get("Macro-AUC", np.nan)),
+                "Fixed_Selection_Alpha": float(fixed_stats.get("alpha", 1.0)),
+                "Fixed_Selection_Mode": str(fixed_stats.get("selection_mode", "")),
+                "Fixed_Selection_Base": str(fixed_stats.get("mix_base", "")),
+            }
+        )
+
+        if legacy_runner._canonical_dataset_name(d_name) == "MIMIC":
+            raw_legacy_rows = legacy_runner._per_class_auc_rows(y_legacy, probs_legacy_raw, dataset_name=d_name, stage_name="legacy_raw")
+            raw_struct_rows = structured_runner._per_class_auc_rows(y_struct, probs_struct_raw, dataset_name=d_name, stage_name="structured_raw")
+            full_legacy_rows = legacy_runner._per_class_auc_rows(y_legacy, probs_legacy_full, dataset_name=d_name, stage_name="legacy_full")
+            fixed_struct_rows = structured_runner._per_class_auc_rows(y_struct, probs_struct_fixed, dataset_name=d_name, stage_name="structured_fixed")
+            full_struct_rows = structured_runner._per_class_auc_rows(y_struct, probs_struct_full, dataset_name=d_name, stage_name="structured_full")
+
+            stage_maps: Dict[str, Dict[str, float]] = {}
+            for bundle in [raw_legacy_rows, raw_struct_rows, full_legacy_rows, fixed_struct_rows, full_struct_rows]:
+                for row in bundle:
+                    cls = str(row["Class"])
+                    stage = str(row["Stage"])
+                    stage_maps.setdefault(cls, {})[stage] = float(row.get("AUC", np.nan))
+
+            for idx, cls_name in enumerate(legacy_runner.config.ORDERED_CLASS_NAMES):
+                row_map = stage_maps.get(str(cls_name), {})
+                auc_legacy_raw = float(row_map.get("legacy_raw", np.nan))
+                auc_struct_raw = float(row_map.get("structured_raw", np.nan))
+                auc_legacy_full = float(row_map.get("legacy_full", np.nan))
+                auc_struct_fixed = float(row_map.get("structured_fixed", np.nan))
+                auc_struct_full = float(row_map.get("structured_full", np.nan))
+                mimic_rows.append(
+                    {
+                        "Dataset": d_name,
+                        "Class": str(cls_name),
+                        "AUC_Legacy_Raw": auc_legacy_raw,
+                        "AUC_Structured_Raw": auc_struct_raw,
+                        "Delta_Raw_vs_Legacy_Raw": auc_struct_raw - auc_legacy_raw if np.isfinite(auc_struct_raw) and np.isfinite(auc_legacy_raw) else np.nan,
+                        "AUC_Legacy_Full": auc_legacy_full,
+                        "AUC_Structured_Fixed": auc_struct_fixed,
+                        "Delta_Fixed_vs_Legacy_Full": auc_struct_fixed - auc_legacy_full if np.isfinite(auc_struct_fixed) and np.isfinite(auc_legacy_full) else np.nan,
+                        "AUC_Structured_Full": auc_struct_full,
+                        "Delta_Full_vs_Legacy_Full": auc_struct_full - auc_legacy_full if np.isfinite(auc_struct_full) and np.isfinite(auc_legacy_full) else np.nan,
+                        "Angle_Raw_vs_Legacy_Raw_Deg": float(angle_raw[idx]) if idx < len(angle_raw) else np.nan,
+                        "Angle_Fixed_vs_Legacy_Full_Deg": float(angle_fixed[idx]) if idx < len(angle_fixed) else np.nan,
+                        "Angle_Full_vs_Legacy_Full_Deg": float(angle_full[idx]) if idx < len(angle_full) else np.nan,
+                    }
+                )
+
+    summary_df = pd.DataFrame(summary_rows)
+    mimic_df = pd.DataFrame(mimic_rows)
+    summary_path = os.path.join(out_dir, "stage_isolation_summary.csv")
+    mimic_path = os.path.join(out_dir, "mimic_per_class_stage_deltas.csv")
+    summary_df.to_csv(summary_path, index=False)
+    mimic_df.to_csv(mimic_path, index=False)
+    print(f"[Saved] {summary_path}")
+    print(f"[Saved] {mimic_path}")
+    return summary_df, mimic_df
+
+
+def _build_site_expert_branch_config(config: CAPA5Config, branch_name: str, save_dir: str) -> CAPA5Config:
+    cfg = copy.deepcopy(config)
+    cfg.DEBUG = False
+    cfg.VERBOSE = False
+    cfg.PRINT_SUMMARY = False
+    cfg.CACHE_MODE = "off"
+    cfg.SAVE_DIR = save_dir
+
+    if branch_name == "legacy_safe":
+        cfg.ENABLE_STRUCTURED_PROMPT_BANK = False
+        cfg.PROMPT_BANK_PROFILE = "v3"
+        cfg.PROMPT_BUCKET_PRIORS = dict(PROMPT_BANK_PROFILE_PRIORS.get(cfg.PROMPT_BANK_PROFILE, DEFAULT_PROMPT_BUCKET_PRIORS))
+        cfg.PROMPT_POOLING_MODE = "mean"
+        cfg.ENABLE_PROMPT_CORESET = False
+        cfg.PROMPT_LEGACY_MIX = 0.0
+        cfg.PROMPT_CLASS_MIX_PROFILE = "none"
+        return cfg
+
+    if branch_name == "structured_visual":
+        cfg.ENABLE_STRUCTURED_PROMPT_BANK = True
+        cfg.PROMPT_BANK_PROFILE = "visual"
+        cfg.PROMPT_BUCKET_PRIORS = dict(PROMPT_BANK_PROFILE_PRIORS.get(cfg.PROMPT_BANK_PROFILE, DEFAULT_PROMPT_BUCKET_PRIORS))
+        cfg.PROMPT_POOLING_MODE = "bucketed"
+        cfg.ENABLE_PROMPT_CORESET = True
+        cfg.PROMPT_BUCKET_KEEP = 1
+        cfg.PROMPT_CORESET_SIZE = max(int(cfg.M), int(cfg.PROMPT_CORESET_SIZE))
+        cfg.PROMPT_LEGACY_MIX = 0.30
+        cfg.PROMPT_CLASS_MIX_PROFILE = "none"
+        return cfg
+
+    if branch_name == "report_surface":
+        cfg.ENABLE_STRUCTURED_PROMPT_BANK = True
+        cfg.PROMPT_BANK_PROFILE = "report"
+        cfg.PROMPT_BUCKET_PRIORS = dict(PROMPT_BANK_PROFILE_PRIORS.get(cfg.PROMPT_BANK_PROFILE, DEFAULT_PROMPT_BUCKET_PRIORS))
+        cfg.PROMPT_POOLING_MODE = "bucketed"
+        cfg.ENABLE_PROMPT_CORESET = True
+        cfg.PROMPT_BUCKET_KEEP = 1
+        cfg.PROMPT_CORESET_SIZE = max(int(cfg.M), int(cfg.PROMPT_CORESET_SIZE))
+        cfg.PROMPT_LEGACY_MIX = 0.18
+        cfg.PROMPT_CLASS_MIX_PROFILE = "none"
+        return cfg
+
+    if branch_name == "mimic_report_hybrid":
+        cfg.ENABLE_STRUCTURED_PROMPT_BANK = True
+        cfg.PROMPT_BANK_PROFILE = "report"
+        cfg.PROMPT_BUCKET_PRIORS = dict(PROMPT_BANK_PROFILE_PRIORS.get(cfg.PROMPT_BANK_PROFILE, DEFAULT_PROMPT_BUCKET_PRIORS))
+        cfg.PROMPT_POOLING_MODE = "bucketed"
+        cfg.ENABLE_PROMPT_CORESET = True
+        cfg.PROMPT_BUCKET_KEEP = 1
+        cfg.PROMPT_CORESET_SIZE = max(int(cfg.M), int(cfg.PROMPT_CORESET_SIZE))
+        cfg.PROMPT_LEGACY_MIX = 0.25
+        cfg.PROMPT_CLASS_MIX_PROFILE = "mimic_hybrid"
+        return cfg
+
+    raise ValueError(f"Unsupported site expert branch: {branch_name}")
+
+
+def _prepare_site_expert_runner(cfg: CAPA5Config) -> Tuple[CAPA5NotebookRunner, List[Dict[str, object]]]:
+    runner = CAPA5NotebookRunner(cfg)
+    runner._build_prototypes()
+    if runner.support_counts is None:
+        runner.support_counts = torch.ones(len(runner.config.ORDERED_CLASS_NAMES), device=runner.device) * runner.config.N_MIN_SUPPORT_FOR_ACTIVE
+    if runner.image_centroids is None:
+        runner.image_centroids = runner.t_raw_pooled.clone()
+    if runner.current_R is None:
+        runner.current_R = torch.eye(runner.t_raw_pooled.shape[1], device=runner.device)
+    runner.run_pipeline()
+    rows = runner.run_manuscript_validation(scoring_mode=cfg.SCORING_MODE, sim_source=cfg.SIM_SOURCE)
+    return runner, rows
+
+
+def _site_expert_row_from_payload(
+    payload: Dict[str, object],
+    *,
+    dataset_name: str,
+    strategy: str,
+    branch_name: str,
+    extra: Optional[Dict[str, object]] = None,
+) -> Dict[str, object]:
+    stats_base = dict(payload.get("stats_base", {}))
+    stats_capa = dict(payload.get("stats_capa", {}))
+    row = {
+        "Dataset": dataset_name,
+        "Strategy": strategy,
+        "Branch": branch_name,
+        "AUC_Baseline_ZeroShot_Macro": float(stats_base.get("Macro-AUC", np.nan)),
+        "AUC_CAPA_Aligned_Macro": float(stats_capa.get("Macro-AUC", np.nan)),
+        "Delta_AUC_CAPA_minus_Baseline_Macro": float(stats_capa.get("Macro-AUC", np.nan)) - float(stats_base.get("Macro-AUC", np.nan)),
+        "ECE_Baseline": float(stats_base.get("ECE", np.nan)),
+        "ECE_CAPA": float(stats_capa.get("ECE", np.nan)),
+        "Top1_Median_CAPA": float(stats_capa.get("Top1_Median", np.nan)),
+    }
+    if extra:
+        row.update(extra)
+    return row
+
+
+def _select_branch_outputs(
+    base_runner: CAPA5NotebookRunner,
+    primary: Dict[str, object],
+    secondary: Dict[str, object],
+    *,
+    primary_name: str,
+    secondary_name: str,
+    conf_margin: float,
+    low_conf_thr: float,
+    fallback_name: str,
+) -> Dict[str, object]:
+    y_primary = np.asarray(primary["y"])
+    y_secondary = np.asarray(secondary["y"])
+    if y_primary.shape != y_secondary.shape or np.any(y_primary != y_secondary):
+        raise RuntimeError("Branch outputs use mismatched sample order or labels; cannot route sample-wise.")
+
+    conf_primary = np.asarray(primary["confidence"], dtype=np.float64).reshape(-1)
+    conf_secondary = np.asarray(secondary["confidence"], dtype=np.float64).reshape(-1)
+    n = min(len(conf_primary), len(conf_secondary))
+    conf_primary = conf_primary[:n]
+    conf_secondary = conf_secondary[:n]
+    y_eval = y_primary[:n]
+
+    choose_primary = conf_primary >= (conf_secondary + float(conf_margin))
+    low_conf = np.maximum(conf_primary, conf_secondary) < float(low_conf_thr)
+    if str(fallback_name) == secondary_name:
+        choose_primary[low_conf] = False
+    else:
+        choose_primary[low_conf] = True
+
+    is_multi = bool(primary.get("is_multi", False))
+    rank_primary = np.asarray(primary["probs_capa_rank"])
+    cal_primary = np.asarray(primary["probs_capa_cal"])
+    rank_secondary = np.asarray(secondary["probs_capa_rank"])
+    cal_secondary = np.asarray(secondary["probs_capa_cal"])
+    if is_multi:
+        rank_selected = np.where(choose_primary[:, None], rank_primary[:n], rank_secondary[:n])
+        cal_selected = np.where(choose_primary[:, None], cal_primary[:n], cal_secondary[:n])
+    else:
+        rank_selected = np.where(choose_primary, rank_primary[:n], rank_secondary[:n])
+        cal_selected = np.where(choose_primary, cal_primary[:n], cal_secondary[:n])
+
+    stats_sel = base_runner._compute_metrics_from_prob_arrays(
+        y_eval,
+        rank_selected,
+        cal_selected,
+        is_multi=is_multi,
+    )
+    stats_base = dict(primary.get("stats_base", secondary.get("stats_base", {})))
+    return {
+        "y": y_eval,
+        "is_multi": is_multi,
+        "stats_base": stats_base,
+        "stats_capa": stats_sel,
+        "primary_usage_rate": float(np.mean(choose_primary.astype(np.float32))),
+        "fallback_rate": float(np.mean(low_conf.astype(np.float32))),
+        "primary_conf_mean": float(np.mean(conf_primary)),
+        "secondary_conf_mean": float(np.mean(conf_secondary)),
+    }
+
+
+def run_site_expert_branch_analysis(config: CAPA5Config) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    out_dir = os.path.join(config.SAVE_DIR, "site_expert")
+    os.makedirs(out_dir, exist_ok=True)
+
+    branch_names = [
+        "legacy_safe",
+        "structured_visual",
+        "report_surface",
+        "mimic_report_hybrid",
+    ]
+    branch_runners: Dict[str, CAPA5NotebookRunner] = {}
+    branch_rows: Dict[str, List[Dict[str, object]]] = {}
+    for branch_name in branch_names:
+        cfg_branch = _build_site_expert_branch_config(
+            config,
+            branch_name=branch_name,
+            save_dir=os.path.join(out_dir, branch_name),
+        )
+        runner_branch, rows_branch = _prepare_site_expert_runner(cfg_branch)
+        branch_runners[branch_name] = runner_branch
+        branch_rows[branch_name] = rows_branch
+
+    branch_summary_rows: List[Dict[str, object]] = []
+    for branch_name, rows in branch_rows.items():
+        for row in rows:
+            branch_summary_rows.append(
+                {
+                    "Dataset": str(row.get("Dataset", "")),
+                    "Strategy": "branch",
+                    "Branch": branch_name,
+                    "AUC_Baseline_ZeroShot_Macro": float(row.get("AUC_Baseline_ZeroShot_Macro", np.nan)),
+                    "AUC_CAPA_Aligned_Macro": float(row.get("AUC_CAPA_Aligned_Macro", np.nan)),
+                    "Delta_AUC_CAPA_minus_Baseline_Macro": float(row.get("Delta_AUC_CAPA_minus_Baseline_Macro", np.nan)),
+                    "ECE_CAPA": float(row.get("ECE_Post", np.nan)),
+                }
+            )
+
+    dynamic_rows: List[Dict[str, object]] = []
+    low_conf_thr = float(getattr(config, "SITE_EXPERT_UNKNOWN_LOW_CONF", 0.60))
+    conf_margin = float(getattr(config, "SITE_EXPERT_UNKNOWN_CONF_MARGIN", 0.0))
+    fixed_map = {
+        "CheXpert": "structured_visual",
+        "MIMIC": "mimic_report_hybrid",
+        "COVID": "structured_visual",
+        "RSNA": "structured_visual",
+    }
+
+    for d_name, path in config.TEST_DATA_PATHS.items():
+        if not os.path.exists(path):
+            continue
+        legacy_payload = branch_runners["legacy_safe"]._predict_dataset_branch_outputs(d_name, path, scoring_mode=config.SCORING_MODE)
+        visual_payload = branch_runners["structured_visual"]._predict_dataset_branch_outputs(d_name, path, scoring_mode=config.SCORING_MODE)
+        report_payload = branch_runners["report_surface"]._predict_dataset_branch_outputs(d_name, path, scoring_mode=config.SCORING_MODE)
+        mimic_payload = branch_runners["mimic_report_hybrid"]._predict_dataset_branch_outputs(d_name, path, scoring_mode=config.SCORING_MODE)
+
+        fixed_branch = fixed_map.get(d_name, "structured_visual")
+        fixed_payload = {
+            "legacy_safe": legacy_payload,
+            "structured_visual": visual_payload,
+            "report_surface": report_payload,
+            "mimic_report_hybrid": mimic_payload,
+        }[fixed_branch]
+        dynamic_rows.append(
+            _site_expert_row_from_payload(
+                fixed_payload,
+                dataset_name=d_name,
+                strategy="site_fixed",
+                branch_name=fixed_branch,
+            )
+        )
+
+        unknown_lv = _select_branch_outputs(
+            branch_runners["legacy_safe"],
+            visual_payload,
+            legacy_payload,
+            primary_name="structured_visual",
+            secondary_name="legacy_safe",
+            conf_margin=conf_margin,
+            low_conf_thr=low_conf_thr,
+            fallback_name="legacy_safe",
+        )
+        dynamic_rows.append(
+            _site_expert_row_from_payload(
+                unknown_lv,
+                dataset_name=d_name,
+                strategy="site_unknown_legacy_visual",
+                branch_name="structured_visual_vs_legacy_safe",
+                extra={
+                    "Primary_Usage_Rate": float(unknown_lv["primary_usage_rate"]),
+                    "LowConf_Fallback_Rate": float(unknown_lv["fallback_rate"]),
+                    "Primary_Conf_Mean": float(unknown_lv["primary_conf_mean"]),
+                    "Secondary_Conf_Mean": float(unknown_lv["secondary_conf_mean"]),
+                },
+            )
+        )
+
+        semantic_vr = _select_branch_outputs(
+            branch_runners["legacy_safe"],
+            visual_payload,
+            report_payload,
+            primary_name="structured_visual",
+            secondary_name="report_surface",
+            conf_margin=conf_margin,
+            low_conf_thr=low_conf_thr,
+            fallback_name="report_surface",
+        )
+        dynamic_rows.append(
+            _site_expert_row_from_payload(
+                semantic_vr,
+                dataset_name=d_name,
+                strategy="site_unknown_visual_report",
+                branch_name="structured_visual_vs_report_surface",
+                extra={
+                    "Primary_Usage_Rate": float(semantic_vr["primary_usage_rate"]),
+                    "LowConf_Fallback_Rate": float(semantic_vr["fallback_rate"]),
+                    "Primary_Conf_Mean": float(semantic_vr["primary_conf_mean"]),
+                    "Secondary_Conf_Mean": float(semantic_vr["secondary_conf_mean"]),
+                },
+            )
+        )
+
+    df_branch = pd.DataFrame(branch_summary_rows)
+    df_dynamic = pd.DataFrame(dynamic_rows)
+    branch_path = os.path.join(out_dir, "site_expert_branch_summary.csv")
+    dynamic_path = os.path.join(out_dir, "site_expert_strategy_summary.csv")
+    df_branch.to_csv(branch_path, index=False)
+    df_dynamic.to_csv(dynamic_path, index=False)
+    print(f"[SiteExpert] saved branch summary -> {branch_path}")
+    print(f"[SiteExpert] saved strategy summary -> {dynamic_path}")
+    return df_branch, df_dynamic
+
+
+def run_go_ml_risk_stratified_analysis(config: CAPA5Config) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    out_dir = os.path.join(config.SAVE_DIR, "go_ml_risk_analysis")
+    os.makedirs(out_dir, exist_ok=True)
+
+    base_cfg = copy.deepcopy(config)
+    base_cfg.DEBUG = False
+    base_cfg.VERBOSE = False
+    base_cfg.PRINT_SUMMARY = False
+    base_cfg.CACHE_MODE = "off"
+    base_cfg.GO_ML_ROBUST_MODE = "none"
+    base_cfg.SAVE_DIR = os.path.join(out_dir, "baseline_residual")
+
+    robust_cfg = copy.deepcopy(config)
+    robust_cfg.DEBUG = False
+    robust_cfg.VERBOSE = False
+    robust_cfg.PRINT_SUMMARY = False
+    robust_cfg.CACHE_MODE = "off"
+    robust_cfg.GO_ML_ROBUST_MODE = "huber"
+    robust_cfg.GO_ML_HUBER_SCOPE = "conditional"
+    robust_cfg.SAVE_DIR = os.path.join(out_dir, "conditional_huber")
+
+    base_runner, _ = _prepare_site_expert_runner(base_cfg)
+    robust_runner, _ = _prepare_site_expert_runner(robust_cfg)
+
+    rows: List[Dict[str, object]] = []
+    thresh_rows: List[Dict[str, object]] = []
+
+    analysis_items: List[Tuple[str, str, int]] = [(d_name, path, 2) for d_name, path in config.TEST_DATA_PATHS.items()]
+    analysis_items.append(("AdaptTrain", config.TRAIN_DATA_PATH, 0))
+
+    for d_name, path, split_override in analysis_items:
+        if not os.path.exists(path):
+            continue
+        payload_base = base_runner._predict_dataset_branch_outputs(
+            d_name,
+            path,
+            scoring_mode=config.SCORING_MODE,
+            split_override=split_override,
+        )
+        payload_robust = robust_runner._predict_dataset_branch_outputs(
+            d_name,
+            path,
+            scoring_mode=config.SCORING_MODE,
+            split_override=split_override,
+        )
+        is_multi = bool(payload_base.get("is_multi", False))
+
+        z_raw, y_eval, _ = base_runner._load_data(path, split_override=split_override)
+        z_proc = base_runner._apply_preprocessing(z_raw, base_runner.zI_mean)
+        g_cpu = torch.Generator()
+        g_cpu.manual_seed(base_runner.config.RANDOM_SEED)
+        perm = torch.randperm(len(z_proc), generator=g_cpu)
+        z_proc = z_proc[perm]
+        if isinstance(y_eval, np.ndarray):
+            y_eval = y_eval[perm.cpu().numpy()]
+        y_use = payload_base["y"]
+        n = min(int(z_proc.shape[0]), int(np.asarray(y_use).shape[0]))
+        z_proc = z_proc[:n]
+        if isinstance(y_use, np.ndarray):
+            y_use = y_use[:n]
+
+        t_base_eval = base_runner._l2_norm(torch.matmul(base_runner._get_alignment_text_base(), base_runner.R_frozen.T))
+        risk_df = base_runner._compute_eval_go_ml_risk_features(z_proc, y_use, t_base_eval)
+        risk_df = risk_df.iloc[:n].copy()
+        risk_df["trigger_candidate"] = risk_df.apply(
+            lambda row: robust_runner._should_use_conditional_huber(
+                active_count=int(row.get("active_count", 0)),
+                resid_meta={
+                    "n_other": max(0, int(row.get("active_count", 0)) - 1),
+                    "cond_reg": float(row.get("cond_reg_max", np.nan)),
+                    "resid_norm_ratio": float(row.get("resid_ratio_max", np.nan)),
+                    "max_other_sim": float(row.get("max_other_sim", np.nan)),
+                },
+                step=None,
+            ),
+            axis=1,
+        )
+
+        base_rank = payload_base["probs_capa_rank"]
+        robust_rank = payload_robust["probs_capa_rank"]
+
+        overall_base = base_runner._macro_auc_subset(y_use, base_rank, is_multi=is_multi)
+        overall_robust = base_runner._macro_auc_subset(y_use, robust_rank, is_multi=is_multi)
+        rows.append(
+            {
+                "Dataset": d_name,
+                "Stratum_Group": "overall",
+                "Stratum_Name": "all",
+                "N_Samples": int(n),
+                "Trigger_Rate": float(risk_df["trigger_candidate"].mean()) if len(risk_df) > 0 else np.nan,
+                "Base_AUC_Macro": overall_base,
+                "ConditionalHuber_AUC_Macro": overall_robust,
+                "Delta_CondHuber_minus_Base": overall_robust - overall_base if np.isfinite(overall_base) and np.isfinite(overall_robust) else np.nan,
+            }
+        )
+
+        if is_multi:
+            card_masks = {
+                "single": (risk_df["active_count"] == 1).to_numpy(),
+                "dual": (risk_df["active_count"] == 2).to_numpy(),
+                "triple_plus": (risk_df["active_count"] >= 3).to_numpy(),
+            }
+            for name, mask in card_masks.items():
+                if int(np.sum(mask)) <= 8:
+                    continue
+                auc_b = base_runner._macro_auc_subset(y_use, base_rank, is_multi=True, sample_mask=mask)
+                auc_r = base_runner._macro_auc_subset(y_use, robust_rank, is_multi=True, sample_mask=mask)
+                rows.append(
+                    {
+                        "Dataset": d_name,
+                        "Stratum_Group": "label_cardinality",
+                        "Stratum_Name": name,
+                        "N_Samples": int(np.sum(mask)),
+                        "Trigger_Rate": float(risk_df.loc[mask, "trigger_candidate"].mean()) if int(np.sum(mask)) > 0 else np.nan,
+                        "Base_AUC_Macro": auc_b,
+                        "ConditionalHuber_AUC_Macro": auc_r,
+                        "Delta_CondHuber_minus_Base": auc_r - auc_b if np.isfinite(auc_b) and np.isfinite(auc_r) else np.nan,
+                    }
+                )
+
+            cond_vals = risk_df.loc[(risk_df["active_count"] >= 2) & np.isfinite(risk_df["cond_reg_max"]), "cond_reg_max"].to_numpy()
+            if cond_vals.size > 0:
+                cond_thr = float(np.median(cond_vals))
+                thresh_rows.append({"Dataset": d_name, "Metric": "cond_reg_max", "Threshold": cond_thr})
+                low_mask = ((risk_df["active_count"] >= 2) & (risk_df["cond_reg_max"] < cond_thr)).to_numpy()
+                high_mask = ((risk_df["active_count"] >= 2) & (risk_df["cond_reg_max"] >= cond_thr)).to_numpy()
+                for name, mask in [("low", low_mask), ("high", high_mask)]:
+                    if int(np.sum(mask)) <= 8:
+                        continue
+                    auc_b = base_runner._macro_auc_subset(y_use, base_rank, is_multi=True, sample_mask=mask)
+                    auc_r = base_runner._macro_auc_subset(y_use, robust_rank, is_multi=True, sample_mask=mask)
+                    rows.append(
+                        {
+                            "Dataset": d_name,
+                            "Stratum_Group": "condition_number",
+                            "Stratum_Name": name,
+                            "N_Samples": int(np.sum(mask)),
+                            "Trigger_Rate": float(risk_df.loc[mask, "trigger_candidate"].mean()),
+                            "Base_AUC_Macro": auc_b,
+                            "ConditionalHuber_AUC_Macro": auc_r,
+                            "Delta_CondHuber_minus_Base": auc_r - auc_b if np.isfinite(auc_b) and np.isfinite(auc_r) else np.nan,
+                        }
+                    )
+
+            ratio_vals = risk_df.loc[(risk_df["active_count"] >= 2) & np.isfinite(risk_df["resid_ratio_max"]), "resid_ratio_max"].to_numpy()
+            if ratio_vals.size > 0:
+                ratio_thr = float(np.median(ratio_vals))
+                thresh_rows.append({"Dataset": d_name, "Metric": "resid_ratio_max", "Threshold": ratio_thr})
+                low_mask = ((risk_df["active_count"] >= 2) & (risk_df["resid_ratio_max"] < ratio_thr)).to_numpy()
+                high_mask = ((risk_df["active_count"] >= 2) & (risk_df["resid_ratio_max"] >= ratio_thr)).to_numpy()
+                for name, mask in [("low", low_mask), ("high", high_mask)]:
+                    if int(np.sum(mask)) <= 8:
+                        continue
+                    auc_b = base_runner._macro_auc_subset(y_use, base_rank, is_multi=True, sample_mask=mask)
+                    auc_r = base_runner._macro_auc_subset(y_use, robust_rank, is_multi=True, sample_mask=mask)
+                    rows.append(
+                        {
+                            "Dataset": d_name,
+                            "Stratum_Group": "residual_ratio",
+                            "Stratum_Name": name,
+                            "N_Samples": int(np.sum(mask)),
+                            "Trigger_Rate": float(risk_df.loc[mask, "trigger_candidate"].mean()),
+                            "Base_AUC_Macro": auc_b,
+                            "ConditionalHuber_AUC_Macro": auc_r,
+                            "Delta_CondHuber_minus_Base": auc_r - auc_b if np.isfinite(auc_b) and np.isfinite(auc_r) else np.nan,
+                        }
+                    )
+
+            support = base_runner.support_counts.detach().cpu().numpy().astype(np.float64)
+            support_thr = float(np.median(support)) if support.size > 0 else np.nan
+            thresh_rows.append({"Dataset": d_name, "Metric": "class_support", "Threshold": support_thr})
+            low_cls = [i for i, v in enumerate(support) if np.isfinite(v) and v < support_thr]
+            high_cls = [i for i, v in enumerate(support) if np.isfinite(v) and v >= support_thr]
+            for name, cls_idx in [("low", low_cls), ("high", high_cls)]:
+                if len(cls_idx) <= 0:
+                    continue
+                auc_b = base_runner._macro_auc_subset(y_use, base_rank, is_multi=True, class_indices=cls_idx)
+                auc_r = base_runner._macro_auc_subset(y_use, robust_rank, is_multi=True, class_indices=cls_idx)
+                rows.append(
+                    {
+                        "Dataset": d_name,
+                        "Stratum_Group": "class_frequency",
+                        "Stratum_Name": name,
+                        "N_Samples": int(n),
+                        "N_Classes": int(len(cls_idx)),
+                        "Trigger_Rate": np.nan,
+                        "Base_AUC_Macro": auc_b,
+                        "ConditionalHuber_AUC_Macro": auc_r,
+                        "Delta_CondHuber_minus_Base": auc_r - auc_b if np.isfinite(auc_b) and np.isfinite(auc_r) else np.nan,
+                    }
+                )
+
+    df_rows = pd.DataFrame(rows)
+    df_thresh = pd.DataFrame(thresh_rows)
+    rows_path = os.path.join(out_dir, "go_ml_risk_strata.csv")
+    thresh_path = os.path.join(out_dir, "go_ml_risk_thresholds.csv")
+    df_rows.to_csv(rows_path, index=False)
+    df_thresh.to_csv(thresh_path, index=False)
+    print(f"[GO-ML-Risk] saved strata -> {rows_path}")
+    print(f"[GO-ML-Risk] saved thresholds -> {thresh_path}")
+    return df_rows, df_thresh
+
+
 if __name__ == "__main__":
     import argparse
 
@@ -4005,6 +6499,77 @@ if __name__ == "__main__":
         "--compare-softmax",
         action="store_true",
         help="Run manuscript validation in both mixed and softmax modes and print a comparison table.",
+    )
+    parser.add_argument(
+        "--structured-prompt-bank",
+        type=str,
+        default="off",
+        choices=["on", "off"],
+        help="Enable/disable structured radiology-style prompt bank construction.",
+    )
+    parser.add_argument(
+        "--prompt-bank-profile",
+        type=str,
+        default="v3",
+        choices=["v1", "v2", "v3"],
+        help="Structured prompt bank profile: v1 exploratory, v2 conservative, or v3 hybrid legacy+structured.",
+    )
+    parser.add_argument(
+        "--prompt-pooling-mode",
+        type=str,
+        default="mean",
+        choices=["mean", "bucketed"],
+        help="Prompt prototype pooling rule: simple mean or bucket-aware weighted pooling.",
+    )
+    parser.add_argument(
+        "--prompt-legacy-mix",
+        type=float,
+        default=0.0,
+        help="When structured prompt bank is enabled, blend structured prototypes into the legacy prompt prototype with this weight.",
+    )
+    parser.add_argument(
+        "--prompt-class-mix-profile",
+        type=str,
+        default="none",
+        choices=["none", "cxr_conservative"],
+        help="Optional class-specific override profile for structured prompt mix weights.",
+    )
+    parser.add_argument(
+        "--prompt-coreset",
+        type=str,
+        default="off",
+        choices=["on", "off"],
+        help="Enable/disable prompt coreset selection from a larger prompt pool.",
+    )
+    parser.add_argument(
+        "--prompt-coreset-size",
+        type=int,
+        default=5,
+        help="Number of prompts kept per class when prompt coreset is enabled.",
+    )
+    parser.add_argument(
+        "--prompt-max-candidates",
+        type=int,
+        default=24,
+        help="Maximum prompt candidates per class before coreset selection.",
+    )
+    parser.add_argument(
+        "--prompt-bucket-keep",
+        type=int,
+        default=2,
+        help="When structured prompt bank is enabled, keep up to this many diverse prompts per bucket during coreset selection.",
+    )
+    parser.add_argument(
+        "--prompt-score-temp",
+        type=float,
+        default=0.12,
+        help="Softmax temperature for within-bucket prompt weighting.",
+    )
+    parser.add_argument(
+        "--prompt-bucket-score-temp",
+        type=float,
+        default=0.18,
+        help="Softmax temperature for bucket-level weighting.",
     )
     parser.add_argument(
         "--cache-mode",
@@ -4163,6 +6728,19 @@ if __name__ == "__main__":
         help="Lambda for CAPA-baseline soft fusion.",
     )
     parser.add_argument(
+        "--guarded-slerp",
+        type=str,
+        default="off",
+        choices=["on", "off"],
+        help="Enable/disable Variant-B style guarded slerp candidate search.",
+    )
+    parser.add_argument(
+        "--guarded-slerp-lambda-max",
+        type=float,
+        default=0.10,
+        help="Maximum slerp step toward image centroids for guarded candidates.",
+    )
+    parser.add_argument(
         "--guarded-alphas",
         type=str,
         default=None,
@@ -4225,6 +6803,25 @@ if __name__ == "__main__":
         help="Dry-run GO alarms without freezing/rollback.",
     )
     parser.add_argument(
+        "--go-stage2",
+        type=str,
+        default="off",
+        choices=["on", "off"],
+        help="Enable/disable Guardian Stage-2 cumulative drift detector.",
+    )
+    parser.add_argument(
+        "--go-stage2-delta",
+        type=float,
+        default=0.01,
+        help="Stage-2 reference margin before cumulative drift is counted.",
+    )
+    parser.add_argument(
+        "--go-stage2-lambda",
+        type=float,
+        default=0.08,
+        help="Stage-2 alarm threshold on the cumulative drift statistic.",
+    )
+    parser.add_argument(
         "--go-ml-proj",
         type=str,
         default="on",
@@ -4253,14 +6850,135 @@ if __name__ == "__main__":
     parser.add_argument(
         "--go-ml-signal",
         type=str,
-        default="original",
-        choices=["original", "residual"],
-        help="Signal vector for GO multi-label update: original embedding or residual direction.",
+        default="residual",
+        choices=["original", "residual", "adaptive"],
+        help="Signal vector for GO multi-label update: original embedding, residual direction, or adaptive mix. Default: residual.",
+    )
+    parser.add_argument(
+        "--go-ml-confounders",
+        type=str,
+        default="full",
+        choices=["full", "topm", "sim_weighted"],
+        help="Which co-occurring labels to project out when computing residuals.",
+    )
+    parser.add_argument(
+        "--go-ml-topm",
+        type=int,
+        default=1,
+        help="When --go-ml-confounders=topm, keep the top-m most similar confounders.",
+    )
+    parser.add_argument(
+        "--go-ml-sim-temp",
+        type=float,
+        default=0.20,
+        help="Temperature for similarity-weighted confounder residualization.",
+    )
+    parser.add_argument(
+        "--go-ml-adapt-min-ratio",
+        type=float,
+        default=0.15,
+        help="Minimum residual-norm ratio before adaptive residual mixing activates strongly.",
+    )
+    parser.add_argument(
+        "--go-ml-robust",
+        type=str,
+        default="none",
+        choices=["none", "huber"],
+        help="Robust residual centroid update rule.",
+    )
+    parser.add_argument(
+        "--go-ml-huber-delta",
+        type=float,
+        default=0.20,
+        help="Cosine-distance Huber threshold for robust residual centroid updates.",
+    )
+    parser.add_argument(
+        "--go-ml-huber-scope",
+        type=str,
+        default="always",
+        choices=["always", "conditional", "warmup"],
+        help="Apply Huber always, only on risky samples, or only during warm-up.",
+    )
+    parser.add_argument(
+        "--go-ml-huber-min-active",
+        type=int,
+        default=3,
+        help="Conditional Huber trigger: minimum active-label count.",
+    )
+    parser.add_argument(
+        "--go-ml-huber-min-cond",
+        type=float,
+        default=25.0,
+        help="Conditional Huber trigger: minimum regularized Gram condition number.",
+    )
+    parser.add_argument(
+        "--go-ml-huber-min-ratio",
+        type=float,
+        default=0.90,
+        help="Conditional Huber trigger: minimum residual/original norm ratio.",
+    )
+    parser.add_argument(
+        "--go-ml-huber-min-sim",
+        type=float,
+        default=0.35,
+        help="Conditional Huber trigger: minimum max similarity to another co-occurring prototype.",
+    )
+    parser.add_argument(
+        "--go-ml-huber-warmup-steps",
+        type=int,
+        default=50,
+        help="If huber scope is warmup, only apply within this many steps.",
+    )
+    parser.add_argument(
+        "--go-ml-risk-analysis",
+        type=str,
+        default="off",
+        choices=["on", "off"],
+        help="Run baseline-residual vs conditional-Huber risk-stratified analysis.",
+    )
+    parser.add_argument(
+        "--dualtrack-abstain",
+        type=str,
+        default="off",
+        choices=["on", "off"],
+        help="Enable/disable low-confidence dual-track abstain-to-raw fallback.",
+    )
+    parser.add_argument(
+        "--dualtrack-abstain-conf",
+        type=float,
+        default=0.60,
+        help="Confidence threshold below which dual-track falls back to the raw head.",
     )
     parser.add_argument(
         "--compare-per-dataset-capa",
         action="store_true",
         help="Run experimental shared-CAPA vs per-dataset-CAPA comparison.",
+    )
+    parser.add_argument(
+        "--prompt-stage-isolation",
+        type=str,
+        default="off",
+        choices=["on", "off"],
+        help="Run prompt stage isolation diagnostics: legacy/raw -> structured/raw -> structured+fixed -> structured+full.",
+    )
+    parser.add_argument(
+        "--site-expert-analysis",
+        type=str,
+        default="off",
+        choices=["on", "off"],
+        help="Run independent branch site-expert analysis with fixed-site and confidence-gated routing.",
+    )
+    parser.add_argument(
+        "--site-expert-low-conf",
+        type=float,
+        default=0.60,
+        help="If both competing branches have confidence below this threshold, use the designated fallback branch.",
+    )
+    parser.add_argument(
+        "--site-expert-conf-margin",
+        type=float,
+        default=0.0,
+        help="Required confidence margin before the primary branch overrides the fallback branch.",
     )
     parser.add_argument(
         "--save-dir",
@@ -4293,6 +7011,19 @@ if __name__ == "__main__":
             if args.min_classes_adapt is not None
             else int(base_cfg.MIN_CLASSES_FOR_ADAPTATION)
         ),
+        ENABLE_STRUCTURED_PROMPT_BANK=(str(args.structured_prompt_bank).lower() == "on"),
+        PROMPT_BANK_PROFILE=str(args.prompt_bank_profile),
+        PROMPT_POOLING_MODE=str(args.prompt_pooling_mode),
+        PROMPT_LEGACY_MIX=min(1.0, max(0.0, float(args.prompt_legacy_mix))),
+        PROMPT_CLASS_MIX_PROFILE=str(args.prompt_class_mix_profile),
+        ENABLE_PROMPT_CORESET=(str(args.prompt_coreset).lower() == "on"),
+        PROMPT_CORESET_SIZE=max(1, int(args.prompt_coreset_size)),
+        PROMPT_BUCKET_KEEP=max(1, int(args.prompt_bucket_keep)),
+        PROMPT_RESOURCE_MAX_CANDIDATES=max(1, int(args.prompt_max_candidates)),
+        PROMPT_SCORE_TEMP=max(1e-3, float(args.prompt_score_temp)),
+        PROMPT_BUCKET_SCORE_TEMP=max(1e-3, float(args.prompt_bucket_score_temp)),
+        SITE_EXPERT_UNKNOWN_LOW_CONF=min(0.99, max(0.0, float(args.site_expert_low_conf))),
+        SITE_EXPERT_UNKNOWN_CONF_MARGIN=max(0.0, float(args.site_expert_conf_margin)),
         SCORING_MODE=str(args.scoring_mode),
         SIM_SOURCE=str(args.sim_source),
         CACHE_MODE=str(args.cache_mode),
@@ -4320,12 +7051,15 @@ if __name__ == "__main__":
         GATE_MAX_OFFDIAG_DELTA=float(args.gate_max_offdiag_delta),
         ENABLE_CAPA_BASELINE_SOFT_FUSION=(str(args.soft_fusion).lower() == "on"),
         CAPA_BASELINE_FUSION_LAMBDA=min(1.0, max(0.0, float(args.soft_fusion_lambda))),
+        ENABLE_CAPAV1_GUARDED_SLERP=(str(args.guarded_slerp).lower() == "on"),
+        CAPAV1_GUARDED_SLERP_LAMBDA_MAX=max(0.0, float(args.guarded_slerp_lambda_max)),
         CAPAV1_GUARDED_ALPHAS=(
             guarded_alphas_override
             if guarded_alphas_override is not None
             else list(base_cfg.CAPAV1_GUARDED_ALPHAS)
         ),
         ENABLE_GO_GUARDIAN=(str(args.go_guardian).lower() == "on"),
+        ENABLE_GO_GUARDIAN_STAGE2=(str(args.go_stage2).lower() == "on"),
         GO_PSI_WINDOW=max(16, int(args.go_psi_window)),
         GO_PSI_BINS=max(5, int(args.go_psi_bins)),
         GO_PSI_THR=max(0.0, float(args.go_psi_thr)),
@@ -4334,11 +7068,28 @@ if __name__ == "__main__":
         GO_WARMUP_STEPS=max(0, int(args.go_warmup_steps)),
         GO_BASELINE_COLLECT_STEPS=max(0, int(args.go_baseline_collect_steps)),
         GO_DRY_RUN=(str(args.go_dry_run).lower() == "on"),
+        GO_STAGE2_DELTA=max(0.0, float(args.go_stage2_delta)),
+        GO_STAGE2_LAMBDA=max(1e-6, float(args.go_stage2_lambda)),
         ENABLE_GO_MULTILABEL_PROJECTION=(str(args.go_ml_proj).lower() == "on"),
         GO_ML_TAU_BASE=max(1e-8, float(args.go_ml_tau)),
         GO_ML_COND_TARGET=max(1.01, float(args.go_ml_cond_target)),
         GO_ML_USE_RESIDUAL_NORM_WEIGHT=(str(args.go_ml_residual_norm).lower() == "on"),
+        GO_ML_SIGNAL_MODE=str(args.go_ml_signal),
         GO_ML_SIGNAL_USE_ORIGINAL=(str(args.go_ml_signal).lower() == "original"),
+        GO_ML_CONFOUNDER_MODE=str(args.go_ml_confounders),
+        GO_ML_TOPM=max(1, int(args.go_ml_topm)),
+        GO_ML_SIM_WEIGHT_TEMP=max(1e-3, float(args.go_ml_sim_temp)),
+        GO_ML_ADAPTIVE_MIN_RESID_RATIO=min(1.0, max(0.0, float(args.go_ml_adapt_min_ratio))),
+        GO_ML_ROBUST_MODE=str(args.go_ml_robust),
+        GO_ML_HUBER_DELTA=max(1e-4, float(args.go_ml_huber_delta)),
+        GO_ML_HUBER_SCOPE=str(args.go_ml_huber_scope),
+        GO_ML_HUBER_COND_MIN_ACTIVE=max(2, int(args.go_ml_huber_min_active)),
+        GO_ML_HUBER_COND_MIN_COND=max(1.0, float(args.go_ml_huber_min_cond)),
+        GO_ML_HUBER_COND_MIN_RESID_RATIO=min(1.0, max(0.0, float(args.go_ml_huber_min_ratio))),
+        GO_ML_HUBER_COND_MIN_OTHER_SIM=min(1.0, max(0.0, float(args.go_ml_huber_min_sim))),
+        GO_ML_HUBER_WARMUP_STEPS=max(0, int(args.go_ml_huber_warmup_steps)),
+        CAPAV1_DUALTRACK_ENABLE_ABSTAIN=(str(args.dualtrack_abstain).lower() == "on"),
+        CAPAV1_DUALTRACK_ABSTAIN_CONF=min(0.99, max(0.0, float(args.dualtrack_abstain_conf))),
         SAVE_DIR=(str(args.save_dir) if args.save_dir else base_cfg.SAVE_DIR),
     )
     runner = CAPA5NotebookRunner(config)
@@ -4401,4 +7152,10 @@ if __name__ == "__main__":
         runner.print_three_way_auc_summary(final_rows)
         if args.compare_per_dataset_capa:
             runner.run_shared_vs_per_dataset_capa(final_rows, scoring_mode=config.SCORING_MODE)
+    if str(args.prompt_stage_isolation).lower() == "on":
+        run_prompt_stage_isolation_analysis(config)
+    if str(args.site_expert_analysis).lower() == "on":
+        run_site_expert_branch_analysis(config)
+    if str(args.go_ml_risk_analysis).lower() == "on":
+        run_go_ml_risk_stratified_analysis(config)
 
