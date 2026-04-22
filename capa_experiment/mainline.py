@@ -718,6 +718,7 @@ class CAPA5Config:
     SCORING_MODE: str = "mixed"  # "mixed" (default) or "softmax"
     SIM_SOURCE: str = "gate"  # "gate" or "dataset"
     TRAIN_BATCH_SIZE: int = 128
+    AUDIT_DISABLE_EARLY_FREEZE: bool = False
     # Cache is an evaluation-only gated expert, disabled by default.
     CACHE_MODE: str = "off"  # off | gated
     CACHE_ALPHA_MAX: float = 0.10
@@ -792,8 +793,12 @@ class CAPA5Config:
             self.BINARY_POSITIVE_CLASS_MAP = copy.deepcopy(BINARY_POSITIVE_CLASS_MAP_CHEXPERT5)
             if int(self.MIN_CLASSES_FOR_ADAPTATION) <= 0:
                 self.MIN_CLASSES_FOR_ADAPTATION = 3
-            self.TEST_DATA_PATHS["CheXpert"] = rf"{self.DATA_ROOT}\cheXpert_200x5.pkl"
-            self.TEST_DATA_PATHS["MIMIC"] = rf"{self.DATA_ROOT}\MIMIC_200x5.pkl"
+            chexpert_test_path = str(self.TEST_DATA_PATHS.get("CheXpert", "") or "").strip()
+            mimic_test_path = str(self.TEST_DATA_PATHS.get("MIMIC", "") or "").strip()
+            if (not chexpert_test_path) or os.path.isdir(chexpert_test_path):
+                self.TEST_DATA_PATHS["CheXpert"] = rf"{self.DATA_ROOT}\cheXpert_200x5.pkl"
+            if not mimic_test_path:
+                self.TEST_DATA_PATHS["MIMIC"] = rf"{self.DATA_ROOT}\MIMIC_200x5.pkl"
         elif label_space in ("5", "u5", "unified5", "unified-5", "5label", "5-label"):
             self.LABEL_SPACE = "unified5"
             self.ORDERED_CLASS_NAMES = list(UNIFIED_5_CLASS_NAMES)
@@ -3535,13 +3540,19 @@ class CAPA5NotebookRunner:
                         # 2. 鍚﹀垯鍙洿鏂板弬鏁帮紝缁х画鏀堕泦鏇村绫诲埆鐨勬暟鎹?
                         coverage_ratio = n_act / n_total
                         if coverage_ratio >= 0.8:
-                            self.is_frozen = True
-                            pbar.set_postfix(pbar_metrics)
-                            self._log(f"[Gate Passed] Freeze R at step={step} (coverage={coverage_ratio:.1%}, 螖s={stats['dS']:.4f})")
-                            self._save_and_report_per_class()
-                            saved_state = True
-                            pbar.close()
-                            break
+                            if bool(getattr(self.config, "AUDIT_DISABLE_EARLY_FREEZE", False)):
+                                self._log(
+                                    f"[Gate Passed][Audit] Early freeze suppressed at step={step} "
+                                    f"(coverage={coverage_ratio:.1%}, 螖s={stats['dS']:.4f}); continuing full train pass."
+                                )
+                            else:
+                                self.is_frozen = True
+                                pbar.set_postfix(pbar_metrics)
+                                self._log(f"[Gate Passed] Freeze R at step={step} (coverage={coverage_ratio:.1%}, 螖s={stats['dS']:.4f})")
+                                self._save_and_report_per_class()
+                                saved_state = True
+                                pbar.close()
+                                break
                         else:
                             # 鍙傛暟鏇存柊浣嗕笉鍐荤粨锛岀户缁€傚簲
                             self._log(f" [Update] R updated with {n_act}/{n_total} classes ({coverage_ratio:.1%}).")
