@@ -1,4 +1,5 @@
 ﻿import os
+import json
 import warnings
 import copy
 from pathlib import Path
@@ -18,7 +19,7 @@ import torch
 import torch.nn.functional as F
 import open_clip
 import matplotlib.pyplot as plt
-from typing import Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Tuple, Optional
 from scipy.optimize import minimize
 from scipy.special import logsumexp
 from scipy.stats import beta as beta_dist, norm
@@ -46,6 +47,109 @@ PROJECT_ROOT = _resolve_project_root()
 DEFAULT_MODEL_DIR = PROJECT_ROOT / "model"
 DEFAULT_DATA_DIR = PROJECT_ROOT / "data"
 DEFAULT_RESULTS_DIR = PROJECT_ROOT / "results"
+ENTRY_SCRIPT_PATH = str(Path(__file__).resolve())
+DEFAULT_TRAIN_SOURCE_FILENAME = "data_train.pkl"
+DEFAULT_CALIB_SUBSET_FILENAME = "data_train_image_calibration_5000.pkl"
+DEFAULT_CALIB_SUBSET_SIZE = 5000
+DEFAULT_TARGET_AWARE_TRAIN_FILENAME = "data_train_chexpert5_target_positive.pkl"
+DEFAULT_TARGET_AWARE_CALIB_FILENAME = "data_train_chexpert5_target_positive_image_calibration.pkl"
+DEFAULT_TARGET_AWARE_SUMMARY_FILENAME = "data_train_chexpert5_target_positive_summary.json"
+
+
+@dataclass(frozen=True)
+class EvalModeSpec:
+    prototype_key: str
+    final_logits_source: str
+    image_preprocessing: bool
+    alignment: bool
+    test_time_adaptation: bool
+    guarded_alignment: bool
+    dual_track: bool
+    cache: bool
+    guardian: bool
+    prior_correction: bool
+    calibration: bool
+    runtime_scale: bool
+    soft_fusion: bool
+    offdiag_gate: bool
+    deploy_overrides: bool
+    notes: str
+
+
+EVAL_MODE_SPECS: Dict[str, EvalModeSpec] = {
+    "raw_baseline": EvalModeSpec(
+        prototype_key="t_raw_text",
+        final_logits_source="raw_direct",
+        image_preprocessing=False,
+        alignment=False,
+        test_time_adaptation=False,
+        guarded_alignment=False,
+        dual_track=False,
+        cache=False,
+        guardian=False,
+        prior_correction=False,
+        calibration=False,
+        runtime_scale=False,
+        soft_fusion=False,
+        offdiag_gate=False,
+        deploy_overrides=False,
+        notes="Frozen backbone with raw image/text embeddings and direct scoring only.",
+    ),
+    "preprocessed_baseline": EvalModeSpec(
+        prototype_key="t_processed_text",
+        final_logits_source="processed_direct",
+        image_preprocessing=True,
+        alignment=False,
+        test_time_adaptation=False,
+        guarded_alignment=False,
+        dual_track=False,
+        cache=False,
+        guardian=False,
+        prior_correction=False,
+        calibration=False,
+        runtime_scale=False,
+        soft_fusion=False,
+        offdiag_gate=False,
+        deploy_overrides=False,
+        notes="Optional diagnostic baseline in the shared processed feature space, without CAPA alignment or deployment routing.",
+    ),
+    "full_capa": EvalModeSpec(
+        prototype_key="t_aligned_text",
+        final_logits_source="aligned_full",
+        image_preprocessing=True,
+        alignment=True,
+        test_time_adaptation=True,
+        guarded_alignment=True,
+        dual_track=True,
+        cache=True,
+        guardian=True,
+        prior_correction=True,
+        calibration=True,
+        runtime_scale=True,
+        soft_fusion=True,
+        offdiag_gate=True,
+        deploy_overrides=True,
+        notes="Complete CAPA path in the shared processed feature space, including official deployment-time routing controls.",
+    ),
+}
+EVAL_MODE_ORDER: Tuple[str, ...] = tuple(EVAL_MODE_SPECS.keys())
+MAIN_EVAL_MODE_ORDER: Tuple[str, ...] = ("raw_baseline", "full_capa")
+EVAL_MODE_ALIASES: Dict[str, str] = {
+    "baseline": "preprocessed_baseline",
+    "processed_baseline": "preprocessed_baseline",
+}
+
+
+def _json_default(value: Any):
+    if isinstance(value, (np.floating, np.integer)):
+        return value.item()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().tolist()
+    if isinstance(value, Path):
+        return str(value)
+    return str(value)
 
 FULL_14_CLASS_NAMES = [
     "Atelectasis", "Cardiomegaly", "Consolidation", "Edema", "Pleural Effusion",
@@ -597,10 +701,16 @@ class CAPA5Config:
     MODEL_NAME: str = 'hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224'
     LOCAL_MODEL_PATH: str = str(DEFAULT_MODEL_DIR)
     DATA_ROOT: str = str(DEFAULT_DATA_DIR)
-    CALIB_DATA_PATH: str = rf"{DATA_ROOT}\CHEXPERT_MIMIC.pkl"
-    TRAIN_DATA_PATH: str = rf"{DATA_ROOT}\data_train.pkl"
-    # Post-hoc temperature scaling should be fit on a held-out calibration set (NOT test sets)
-    TAU_CALIB_DATA_PATH: str = rf"{DATA_ROOT}\CHEXPERT_MIMIC.pkl"
+    # Source 14-label pool. The mainline materializes a CheXpert-5 target-aware view from it.
+    TRAIN_SOURCE_DATA_PATH: str = rf"{DATA_ROOT}\{DEFAULT_TRAIN_SOURCE_FILENAME}"
+    # Main CheXpert-5 target-aware training pool: rows containing at least one target finding.
+    TRAIN_DATA_PATH: str = rf"{DATA_ROOT}\{DEFAULT_TARGET_AWARE_TRAIN_FILENAME}"
+    # Cross-modal pool used for retrieval-style analysis only.
+    CROSS_MODAL_DATA_PATH: str = rf"{DATA_ROOT}\CHEXPERT_MIMIC.pkl"
+    # Dedicated target-aware image-only calibration subset, materialized from TRAIN_SOURCE_DATA_PATH if missing.
+    CALIB_DATA_PATH: str = rf"{DATA_ROOT}\{DEFAULT_TARGET_AWARE_CALIB_FILENAME}"
+    # Post-hoc temperature scaling should be fit on a held-out calibration set (NOT test sets).
+    TAU_CALIB_DATA_PATH: str = rf"{DATA_ROOT}\{DEFAULT_TARGET_AWARE_CALIB_FILENAME}"
     TAU_CALIB_FRAC: float = 0.2
     TAU_CALIB_MAX: int = 5000
     TAU_CALIB_MIN: int = 2000
@@ -610,13 +720,14 @@ class CAPA5Config:
     PRINT_SUMMARY: bool = True
     DEBUG: bool = False
     SAVE_DIR: str = str(DEFAULT_RESULTS_DIR)
+    ENTRY_SCRIPT: str = ENTRY_SCRIPT_PATH
     AUC_BOOTSTRAP_ROUNDS: int = 1000
     
     TEST_DATA_PATHS: Dict[str, str] = field(default_factory=lambda: {
-        "CheXpert": str(DEFAULT_DATA_DIR / "raw_data" / "CheXpert-v1.0-small"),
+        "CheXpert": str(DEFAULT_DATA_DIR / "cheXpert_200x5.pkl"),
         "MIMIC":    str(DEFAULT_DATA_DIR / "MIMIC_200x5.pkl"),
-        "COVID":    str(DEFAULT_DATA_DIR / "raw_data" / "COVID19-Radiography-Database"),
-        "RSNA":     str(DEFAULT_DATA_DIR / "raw_data" / "rsna"),
+        "COVID":    str(DEFAULT_DATA_DIR / "COVID_3616x2.pkl"),
+        "RSNA":     str(DEFAULT_DATA_DIR / "RSNA_4243x2.pkl"),
     })
     PARAM_PROFILE: str = "default"
     LABEL_SPACE: str = "chexpert5"
@@ -717,6 +828,7 @@ class CAPA5Config:
     TAU_PRIOR: float = 0.05
     SCORING_MODE: str = "mixed"  # "mixed" (default) or "softmax"
     SIM_SOURCE: str = "gate"  # "gate" or "dataset"
+    EVAL_MODE: str = "full_capa"
     TRAIN_BATCH_SIZE: int = 128
     AUDIT_DISABLE_EARLY_FREEZE: bool = False
     # Cache is an evaluation-only gated expert, disabled by default.
@@ -793,12 +905,62 @@ class CAPA5Config:
             self.BINARY_POSITIVE_CLASS_MAP = copy.deepcopy(BINARY_POSITIVE_CLASS_MAP_CHEXPERT5)
             if int(self.MIN_CLASSES_FOR_ADAPTATION) <= 0:
                 self.MIN_CLASSES_FOR_ADAPTATION = 3
+            default_source_path = os.path.join(self.DATA_ROOT, DEFAULT_TRAIN_SOURCE_FILENAME)
+            default_train_path = os.path.join(self.DATA_ROOT, DEFAULT_TARGET_AWARE_TRAIN_FILENAME)
+            default_calib_path = os.path.join(self.DATA_ROOT, DEFAULT_TARGET_AWARE_CALIB_FILENAME)
+            legacy_default_calib_path = os.path.join(self.DATA_ROOT, DEFAULT_CALIB_SUBSET_FILENAME)
+
+            def _same_path(a: str, b: str) -> bool:
+                if not a or not b:
+                    return False
+                return os.path.normcase(os.path.abspath(str(a))) == os.path.normcase(os.path.abspath(str(b)))
+
+            source_path = str(getattr(self, "TRAIN_SOURCE_DATA_PATH", "") or "").strip()
+            if (not source_path) or os.path.isdir(source_path):
+                self.TRAIN_SOURCE_DATA_PATH = str(default_source_path)
+            train_path = str(getattr(self, "TRAIN_DATA_PATH", "") or "").strip()
+            if (
+                (not train_path)
+                or os.path.isdir(train_path)
+                or _same_path(train_path, self.TRAIN_SOURCE_DATA_PATH)
+                or _same_path(train_path, default_source_path)
+            ):
+                self.TRAIN_DATA_PATH = str(default_train_path)
+            cross_modal_path = str(getattr(self, "CROSS_MODAL_DATA_PATH", "") or "").strip()
+            if (not cross_modal_path) or os.path.isdir(cross_modal_path):
+                self.CROSS_MODAL_DATA_PATH = rf"{self.DATA_ROOT}\CHEXPERT_MIMIC.pkl"
+            calib_path = str(getattr(self, "CALIB_DATA_PATH", "") or "").strip()
+            if (
+                (not calib_path)
+                or os.path.isdir(calib_path)
+                or _same_path(calib_path, self.CROSS_MODAL_DATA_PATH)
+                or _same_path(calib_path, self.TRAIN_DATA_PATH)
+                or _same_path(calib_path, self.TRAIN_SOURCE_DATA_PATH)
+                or _same_path(calib_path, legacy_default_calib_path)
+            ):
+                self.CALIB_DATA_PATH = str(default_calib_path)
+            tau_calib_path = str(getattr(self, "TAU_CALIB_DATA_PATH", "") or "").strip()
+            if (
+                (not tau_calib_path)
+                or os.path.isdir(tau_calib_path)
+                or _same_path(tau_calib_path, self.CROSS_MODAL_DATA_PATH)
+                or _same_path(tau_calib_path, self.TRAIN_DATA_PATH)
+                or _same_path(tau_calib_path, self.TRAIN_SOURCE_DATA_PATH)
+                or _same_path(tau_calib_path, legacy_default_calib_path)
+            ):
+                self.TAU_CALIB_DATA_PATH = str(default_calib_path)
             chexpert_test_path = str(self.TEST_DATA_PATHS.get("CheXpert", "") or "").strip()
             mimic_test_path = str(self.TEST_DATA_PATHS.get("MIMIC", "") or "").strip()
+            covid_test_path = str(self.TEST_DATA_PATHS.get("COVID", "") or "").strip()
+            rsna_test_path = str(self.TEST_DATA_PATHS.get("RSNA", "") or "").strip()
             if (not chexpert_test_path) or os.path.isdir(chexpert_test_path):
                 self.TEST_DATA_PATHS["CheXpert"] = rf"{self.DATA_ROOT}\cheXpert_200x5.pkl"
-            if not mimic_test_path:
+            if (not mimic_test_path) or os.path.isdir(mimic_test_path):
                 self.TEST_DATA_PATHS["MIMIC"] = rf"{self.DATA_ROOT}\MIMIC_200x5.pkl"
+            if (not covid_test_path) or os.path.isdir(covid_test_path):
+                self.TEST_DATA_PATHS["COVID"] = rf"{self.DATA_ROOT}\COVID_3616x2.pkl"
+            if (not rsna_test_path) or os.path.isdir(rsna_test_path):
+                self.TEST_DATA_PATHS["RSNA"] = rf"{self.DATA_ROOT}\RSNA_4243x2.pkl"
         elif label_space in ("5", "u5", "unified5", "unified-5", "5label", "5-label"):
             self.LABEL_SPACE = "unified5"
             self.ORDERED_CLASS_NAMES = list(UNIFIED_5_CLASS_NAMES)
@@ -819,6 +981,12 @@ class CAPA5Config:
                 f"Unsupported SOURCE_LABEL_ORDER_PROFILE={self.SOURCE_LABEL_ORDER_PROFILE}. "
                 "Use 'default' or 'chexpert5_reordered_200x5'."
             )
+
+        eval_mode = str(getattr(self, "EVAL_MODE", "full_capa")).strip().lower()
+        eval_mode = EVAL_MODE_ALIASES.get(eval_mode, eval_mode)
+        if eval_mode not in EVAL_MODE_SPECS:
+            raise ValueError(f"Unsupported EVAL_MODE={self.EVAL_MODE}. Use one of {list(EVAL_MODE_SPECS)}.")
+        self.EVAL_MODE = eval_mode
 
         cache_mode = str(getattr(self, "CACHE_MODE", "off")).strip().lower()
         if cache_mode not in ("off", "gated"):
@@ -878,16 +1046,6 @@ class CAPA5Config:
         self.GO_ML_HUBER_WARMUP_STEPS = max(0, int(getattr(self, "GO_ML_HUBER_WARMUP_STEPS", int(self.WARMUP_BATCHES))))
         self.GO_ML_ADAPTIVE_MIN_RESID_RATIO = min(1.0, max(0.0, float(getattr(self, "GO_ML_ADAPTIVE_MIN_RESID_RATIO", 0.15))))
 
-        self.ENABLE_GO_GUARDIAN = True
-        self.GATE_REQUIRE_OFFDIAG_IMPROVEMENT = True
-        if float(self.GATE_MAX_OFFDIAG_DELTA) <= 0.0:
-            self.GATE_MAX_OFFDIAG_DELTA = 0.06
-        if float(self.RHO) < 0.88:
-            self.RHO = 0.88
-        if float(self.CAPA_BASELINE_FUSION_LAMBDA) >= 1.0:
-            self.CAPA_BASELINE_FUSION_LAMBDA = float(self.CAPAV1_DUALTRACK_BLEND)
-        if float(self.TAU_PRIOR) <= 0.0:
-            self.TAU_PRIOR = 0.05
         if bool(self.DEBUG):
             self.CAPAV1_GUARDED_DUMP = True
 
@@ -900,34 +1058,277 @@ class CAPA5Config:
             self.KAPPA_EMA = float(np.clip(self.PROF_KAPPA_EMA, 30.0, 80.0))
             self.GATE_USE_RHO_QUANTILE = True
             self.RHO_QUANTILE = 0.80
-            self.ENABLE_GO_GUARDIAN = True
-            self.GO_DRY_RUN = True
-            self.GO_PSI_THR = float(self.PROF_PSI_THR)
-            self.CAPA_BASELINE_FUSION_LAMBDA = min(
-                float(self.CAPA_BASELINE_FUSION_LAMBDA),
-                float(self.PROF_LAMBDA_MAX),
-            )
-            self.PROF_AUTO_SCALE = True
-            self.PROF_AUTO_TEMPERATURE = True
-            self.PROF_AUTO_THRESHOLDS = True
-            self.PROF_DYNAMIC_EPSILON = True
-            self.PROF_DYNAMIC_TAU = True
 
 class CAPA5NotebookRunner:
     def __init__(self, config: CAPA5Config):
         self.config = config
         self.device = torch.device(self.config.DEVICE)
         self.config.VERBOSE = bool(self.config.VERBOSE) or bool(getattr(self.config, "DEBUG", False))
+        self._ensure_calibration_files_ready()
+        self.eval_runtime = self._build_eval_runtime()
         self._log(f"[CAPA] Init on {self.device} (verbose={self.config.VERBOSE})")
         self._init_seed()
         self._init_clip_model()
         self._init_state()
+        self._log_eval_mode_summary(always=True)
         if not os.path.exists(self.config.SAVE_DIR):
             os.makedirs(self.config.SAVE_DIR)
 
     def _log(self, msg: str, *, always: bool = False):
         if always or self.config.VERBOSE:
             print(msg)
+
+    @staticmethod
+    def _norm_path(path: str) -> str:
+        return os.path.normcase(os.path.abspath(str(path)))
+
+    def _default_data_path(self, filename: str) -> str:
+        return os.path.join(str(self.config.DATA_ROOT), filename)
+
+    def _is_default_data_path(self, path: str, filename: str) -> bool:
+        if not path:
+            return False
+        return self._norm_path(self._resolve_legacy_data_path(path)) == self._norm_path(
+            self._default_data_path(filename)
+        )
+
+    def _ensure_calibration_files_ready(self) -> None:
+        self._ensure_target_aware_data_files_ready()
+        targets = []
+        for path in [getattr(self.config, "CALIB_DATA_PATH", ""), getattr(self.config, "TAU_CALIB_DATA_PATH", "")]:
+            path_str = str(path or "").strip()
+            if not path_str:
+                continue
+            resolved = self._resolve_legacy_data_path(path_str)
+            if resolved not in targets:
+                targets.append(resolved)
+        for target in targets:
+            if os.path.exists(target):
+                continue
+            self._materialize_calibration_subset_from_train(target)
+
+    def _ensure_target_aware_data_files_ready(self) -> None:
+        if str(getattr(self.config, "LABEL_SPACE", "")).strip().lower() != "chexpert5":
+            return
+
+        train_path = str(getattr(self.config, "TRAIN_DATA_PATH", "") or "").strip()
+        calib_path = str(getattr(self.config, "CALIB_DATA_PATH", "") or "").strip()
+        tau_calib_path = str(getattr(self.config, "TAU_CALIB_DATA_PATH", "") or "").strip()
+
+        wants_default_train = self._is_default_data_path(train_path, DEFAULT_TARGET_AWARE_TRAIN_FILENAME)
+        wants_default_calib = self._is_default_data_path(calib_path, DEFAULT_TARGET_AWARE_CALIB_FILENAME)
+        wants_default_tau_calib = self._is_default_data_path(
+            tau_calib_path,
+            DEFAULT_TARGET_AWARE_CALIB_FILENAME,
+        )
+        if not (wants_default_train or wants_default_calib or wants_default_tau_calib):
+            return
+
+        target_train_path = (
+            self._resolve_legacy_data_path(train_path)
+            if wants_default_train
+            else self._default_data_path(DEFAULT_TARGET_AWARE_TRAIN_FILENAME)
+        )
+        target_calib_path = (
+            self._resolve_legacy_data_path(calib_path)
+            if wants_default_calib
+            else self._default_data_path(DEFAULT_TARGET_AWARE_CALIB_FILENAME)
+        )
+        missing_train = wants_default_train and (not os.path.exists(target_train_path))
+        missing_calib = (wants_default_calib or wants_default_tau_calib) and (not os.path.exists(target_calib_path))
+        summary_path = self._default_data_path(DEFAULT_TARGET_AWARE_SUMMARY_FILENAME)
+        if not (missing_train or missing_calib or (not os.path.exists(summary_path))):
+            return
+
+        self._materialize_chexpert5_target_aware_data(
+            train_target_path=target_train_path,
+            calib_target_path=target_calib_path,
+        )
+
+    @staticmethod
+    def _stack_label_values(values) -> np.ndarray:
+        rows = []
+        for value in values:
+            if isinstance(value, torch.Tensor):
+                value = value.detach().cpu().numpy()
+            rows.append(np.asarray(value))
+        return np.stack(rows).astype(np.float32)
+
+    @staticmethod
+    def _value_counts_as_json_dict(series: pd.Series) -> Dict[str, int]:
+        return {str(k): int(v) for k, v in series.value_counts(dropna=False).to_dict().items()}
+
+    @staticmethod
+    def _int_distribution(values: np.ndarray) -> Dict[str, int]:
+        values = np.asarray(values).astype(int)
+        uniq, counts = np.unique(values, return_counts=True)
+        return {str(int(k)): int(v) for k, v in zip(uniq, counts)}
+
+    def _load_dataframe_pickle(self, path: str, *, role: str) -> pd.DataFrame:
+        try:
+            with open(path, "rb") as f:
+                blob = pickle.load(f)
+        except Exception:
+            blob = torch.load(path, map_location="cpu", weights_only=False)
+        if not isinstance(blob, pd.DataFrame):
+            raise RuntimeError(
+                f"Automatic {role} materialization expects a DataFrame pickle; "
+                f"got {type(blob).__name__} from {path}."
+            )
+        return blob
+
+    def _materialize_chexpert5_target_aware_data(
+        self,
+        *,
+        train_target_path: str,
+        calib_target_path: str,
+    ) -> None:
+        source_path = str(getattr(self.config, "TRAIN_SOURCE_DATA_PATH", "") or "").strip()
+        if not source_path:
+            source_path = self._default_data_path(DEFAULT_TRAIN_SOURCE_FILENAME)
+        source_path = self._resolve_legacy_data_path(source_path)
+        if not os.path.exists(source_path):
+            raise FileNotFoundError(
+                f"Cannot build CheXpert-5 target-aware data because TRAIN_SOURCE_DATA_PATH is missing: {source_path}"
+            )
+
+        df_source = self._load_dataframe_pickle(source_path, role="CheXpert-5 target-aware data")
+        if "Embedding" not in df_source.columns:
+            raise RuntimeError(f"Cannot build target-aware train from {source_path}: missing 'Embedding' column.")
+        if "labels" not in df_source.columns:
+            raise RuntimeError(f"Cannot build target-aware train from {source_path}: missing 'labels' column.")
+
+        y_source = self._stack_label_values(df_source["labels"].values)
+        if y_source.ndim != 2 or y_source.shape[1] < len(FULL_14_CLASS_NAMES):
+            raise RuntimeError(
+                f"Expected full 14-label vectors in {source_path}; got shape={tuple(y_source.shape)}."
+            )
+
+        target_cols = [FULL_14_CLASS_NAMES.index(name) for name in CHEXPERT_5_CLASS_NAMES]
+        y_target = y_source[:, target_cols]
+        target_positive_counts = y_target.sum(axis=1)
+        train_mask = target_positive_counts > 0
+        df_train = df_source.loc[train_mask].copy().reset_index(drop=True)
+        if len(df_train) <= 0:
+            raise RuntimeError(f"No rows in {source_path} contain any CheXpert-5 target label.")
+
+        if "modality" in df_train.columns:
+            image_mask = df_train["modality"].astype(str).str.lower().eq("image")
+            df_calib_pool = df_train.loc[image_mask].copy().reset_index(drop=True)
+        else:
+            df_calib_pool = df_train.copy()
+        if len(df_calib_pool) <= 0:
+            raise RuntimeError(f"No image rows in {source_path} contain any CheXpert-5 target label.")
+
+        n_keep = min(int(DEFAULT_CALIB_SUBSET_SIZE), int(len(df_calib_pool)))
+        df_calib = df_calib_pool.sample(n=n_keep, random_state=int(self.config.RANDOM_SEED)).reset_index(drop=True)
+
+        train_target_path = self._resolve_legacy_data_path(str(train_target_path))
+        calib_target_path = self._resolve_legacy_data_path(str(calib_target_path))
+        os.makedirs(os.path.dirname(os.path.abspath(train_target_path)), exist_ok=True)
+        os.makedirs(os.path.dirname(os.path.abspath(calib_target_path)), exist_ok=True)
+
+        wrote_parts = []
+        if not os.path.exists(train_target_path):
+            with open(train_target_path, "wb") as f:
+                pickle.dump(df_train, f, protocol=pickle.HIGHEST_PROTOCOL)
+            wrote_parts.append("train")
+        if not os.path.exists(calib_target_path):
+            with open(calib_target_path, "wb") as f:
+                pickle.dump(df_calib, f, protocol=pickle.HIGHEST_PROTOCOL)
+            wrote_parts.append("calib")
+
+        y_train = self._stack_label_values(df_train["labels"].values)
+        y_calib = self._stack_label_values(df_calib["labels"].values)
+        summary = {
+            "source_train_path": str(source_path),
+            "target_train_path": str(train_target_path),
+            "target_calib_path": str(calib_target_path),
+            "label_space": "chexpert5",
+            "target_class_names": list(CHEXPERT_5_CLASS_NAMES),
+            "target_cols_in_full14": [int(x) for x in target_cols],
+            "random_seed": int(self.config.RANDOM_SEED),
+            "calib_subset_size_requested": int(DEFAULT_CALIB_SUBSET_SIZE),
+            "source_rows": int(len(df_source)),
+            "target_positive_train_rows": int(len(df_train)),
+            "target_positive_calib_rows": int(len(df_calib)),
+            "source_modality_counts": (
+                self._value_counts_as_json_dict(df_source["modality"])
+                if "modality" in df_source.columns
+                else {}
+            ),
+            "train_modality_counts": (
+                self._value_counts_as_json_dict(df_train["modality"])
+                if "modality" in df_train.columns
+                else {}
+            ),
+            "calib_modality_counts": (
+                self._value_counts_as_json_dict(df_calib["modality"])
+                if "modality" in df_calib.columns
+                else {}
+            ),
+            "target_positive_count_distribution_train": self._int_distribution(
+                y_train[:, target_cols].sum(axis=1)
+            ),
+            "target_positive_count_distribution_calib": self._int_distribution(
+                y_calib[:, target_cols].sum(axis=1)
+            ),
+            "target_class_counts_train": {
+                name: int(y_train[:, col].sum()) for name, col in zip(CHEXPERT_5_CLASS_NAMES, target_cols)
+            },
+            "target_class_counts_calib": {
+                name: int(y_calib[:, col].sum()) for name, col in zip(CHEXPERT_5_CLASS_NAMES, target_cols)
+            },
+        }
+        summary_path = self._default_data_path(DEFAULT_TARGET_AWARE_SUMMARY_FILENAME)
+        os.makedirs(os.path.dirname(os.path.abspath(summary_path)), exist_ok=True)
+        with open(summary_path, "w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2, ensure_ascii=True)
+
+        action = "Created" if wrote_parts else "Verified"
+        self._log(
+            f"[DataLayout] {action} CheXpert-5 target-aware train/calib "
+            f"from {source_path} (train_rows={len(df_train)}, calib_rows={len(df_calib)}, "
+            f"wrote={','.join(wrote_parts) if wrote_parts else 'none'}).",
+            always=True,
+        )
+
+    def _materialize_calibration_subset_from_train(self, target_path: str) -> None:
+        train_src = self._resolve_legacy_data_path(self.config.TRAIN_DATA_PATH)
+        if not os.path.exists(train_src):
+            raise FileNotFoundError(f"Cannot build calibration file because TRAIN_DATA_PATH is missing: {train_src}")
+        try:
+            with open(train_src, "rb") as f:
+                train_blob = pickle.load(f)
+        except Exception:
+            train_blob = torch.load(train_src, map_location="cpu", weights_only=False)
+
+        if not isinstance(train_blob, pd.DataFrame):
+            raise RuntimeError(
+                f"Automatic calibration subset generation expects TRAIN_DATA_PATH to be a DataFrame pickle; "
+                f"got {type(train_blob).__name__} from {train_src}."
+            )
+        df_train = train_blob.copy()
+        if "Embedding" not in df_train.columns:
+            raise RuntimeError(f"Cannot build calibration subset from {train_src}: missing 'Embedding' column.")
+        if "labels" not in df_train.columns:
+            raise RuntimeError(f"Cannot build calibration subset from {train_src}: missing 'labels' column.")
+        if "modality" in df_train.columns:
+            image_mask = df_train["modality"].astype(str).str.lower().eq("image")
+            df_train = df_train.loc[image_mask].copy()
+        if len(df_train) <= 0:
+            raise RuntimeError(f"Cannot build calibration subset from {train_src}: no image rows found.")
+
+        n_keep = min(int(DEFAULT_CALIB_SUBSET_SIZE), int(len(df_train)))
+        df_calib = df_train.sample(n=n_keep, random_state=int(self.config.RANDOM_SEED)).reset_index(drop=True)
+        os.makedirs(os.path.dirname(target_path), exist_ok=True)
+        with open(target_path, "wb") as f:
+            pickle.dump(df_calib, f, protocol=pickle.HIGHEST_PROTOCOL)
+        self._log(
+            f"[DataLayout] Created calibration subset {target_path} from {train_src} "
+            f"(rows={len(df_calib)}, modality=image, seed={self.config.RANDOM_SEED}).",
+            always=True,
+        )
     
     def _init_seed(self):
         random.seed(self.config.RANDOM_SEED)
@@ -938,8 +1339,203 @@ class CAPA5NotebookRunner:
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
 
+    def _current_eval_mode(self) -> str:
+        return str(self.eval_runtime.get("eval_mode", getattr(self.config, "EVAL_MODE", "full_capa")))
+
+    def _build_eval_runtime(self) -> Dict[str, Any]:
+        mode = str(getattr(self.config, "EVAL_MODE", "full_capa")).strip().lower()
+        mode = EVAL_MODE_ALIASES.get(mode, mode)
+        spec = EVAL_MODE_SPECS[mode]
+        overrides: List[Dict[str, Any]] = []
+
+        def record_override(name: str, requested: Any, effective: Any, reason: str) -> None:
+            if requested == effective:
+                return
+            overrides.append(
+                {
+                    "name": name,
+                    "requested": requested,
+                    "effective": effective,
+                    "reason": reason,
+                }
+            )
+
+        guardian_enabled = bool(spec.guardian)
+        guardian_requested = bool(getattr(self.config, "ENABLE_GO_GUARDIAN", False))
+        if spec.deploy_overrides and spec.guardian and (not guardian_requested):
+            record_override("ENABLE_GO_GUARDIAN", False, True, f"{mode} restores guardian")
+        elif (not spec.guardian) and guardian_requested:
+            record_override("ENABLE_GO_GUARDIAN", True, False, f"{mode} disables guardian")
+
+        dual_track_enabled = bool(spec.dual_track)
+        if (not spec.dual_track) and bool(getattr(self.config, "CAPAV1_DUALTRACK_ENABLE_ABSTAIN", False)):
+            record_override("CAPAV1_DUALTRACK_ENABLE_ABSTAIN", True, False, f"{mode} disables dual-track routing")
+
+        cache_requested = str(getattr(self.config, "CACHE_MODE", "off")).strip().lower() == "gated"
+        cache_enabled = bool(spec.cache) and bool(cache_requested)
+        if (not spec.cache) and cache_requested:
+            record_override("CACHE_MODE", "gated", "off", f"{mode} disables cache")
+
+        calibration_enabled = bool(spec.calibration)
+        runtime_scale_enabled = bool(spec.runtime_scale)
+
+        prior_requested = float(getattr(self.config, "TAU_PRIOR", 0.0))
+        if spec.prior_correction:
+            prior_strength = prior_requested
+            if spec.deploy_overrides and prior_strength <= 0.0:
+                prior_strength = 0.05
+                record_override("TAU_PRIOR", prior_requested, prior_strength, f"{mode} restores prior correction")
+        else:
+            prior_strength = 0.0
+            if abs(prior_requested) > 1e-12:
+                record_override("TAU_PRIOR", prior_requested, 0.0, f"{mode} disables prior correction")
+
+        soft_fusion_requested = bool(getattr(self.config, "ENABLE_CAPA_BASELINE_SOFT_FUSION", False))
+        soft_fusion_enabled = bool(spec.soft_fusion) and soft_fusion_requested
+        if (not spec.soft_fusion) and soft_fusion_requested:
+            record_override(
+                "ENABLE_CAPA_BASELINE_SOFT_FUSION",
+                soft_fusion_requested,
+                False,
+                f"{mode} disables baseline fusion",
+            )
+        fusion_lambda = float(getattr(self.config, "CAPA_BASELINE_FUSION_LAMBDA", 1.0))
+        if soft_fusion_enabled and spec.deploy_overrides and fusion_lambda >= 1.0:
+            eff_lambda = float(getattr(self.config, "CAPAV1_DUALTRACK_BLEND", 1.0))
+            record_override(
+                "CAPA_BASELINE_FUSION_LAMBDA",
+                fusion_lambda,
+                eff_lambda,
+                f"{mode} restores baseline fusion mixing",
+            )
+            fusion_lambda = eff_lambda
+        if not soft_fusion_enabled:
+            fusion_lambda = 1.0
+
+        offdiag_gate_enabled = bool(spec.offdiag_gate)
+        gate_requested = bool(getattr(self.config, "GATE_REQUIRE_OFFDIAG_IMPROVEMENT", False))
+        if spec.deploy_overrides and spec.offdiag_gate and (not gate_requested):
+            record_override(
+                "GATE_REQUIRE_OFFDIAG_IMPROVEMENT",
+                gate_requested,
+                True,
+                f"{mode} restores guarded off-diagonal gate",
+            )
+        elif (not spec.offdiag_gate) and gate_requested:
+            record_override(
+                "GATE_REQUIRE_OFFDIAG_IMPROVEMENT",
+                gate_requested,
+                False,
+                f"{mode} disables guarded off-diagonal gate",
+            )
+        gate_max_offdiag_delta = float(getattr(self.config, "GATE_MAX_OFFDIAG_DELTA", 0.0))
+        if offdiag_gate_enabled and spec.deploy_overrides and gate_max_offdiag_delta <= 0.0:
+            record_override(
+                "GATE_MAX_OFFDIAG_DELTA",
+                gate_max_offdiag_delta,
+                0.06,
+                f"{mode} restores off-diagonal gate threshold",
+            )
+            gate_max_offdiag_delta = 0.06
+
+        rho_effective = float(getattr(self.config, "RHO", 0.85))
+        if spec.deploy_overrides and rho_effective < 0.88:
+            record_override("RHO", rho_effective, 0.88, f"{mode} restores rho floor")
+            rho_effective = 0.88
+
+        final_logits_source = str(spec.final_logits_source)
+        if dual_track_enabled:
+            final_logits_source = f"{final_logits_source}+dualtrack"
+        if cache_enabled:
+            final_logits_source = f"{final_logits_source}+cache"
+
+        return {
+            "eval_mode": mode,
+            "spec": spec,
+            "prototype_source": spec.prototype_key,
+            "final_logits_source": final_logits_source,
+            "image_preprocessing": bool(spec.image_preprocessing),
+            "alignment": bool(spec.alignment),
+            "test_time_adaptation": bool(spec.test_time_adaptation),
+            "guarded_alignment": bool(spec.guarded_alignment),
+            "dual_track": dual_track_enabled,
+            "cache": cache_enabled,
+            "cache_mode": "gated" if cache_enabled else "off",
+            "guardian": guardian_enabled,
+            "prior_correction": bool(spec.prior_correction),
+            "prior_strength": float(prior_strength),
+            "calibration": calibration_enabled,
+            "runtime_scale": runtime_scale_enabled,
+            "soft_fusion": soft_fusion_enabled,
+            "fusion_lambda": float(fusion_lambda),
+            "offdiag_gate": offdiag_gate_enabled,
+            "gate_max_offdiag_delta": float(gate_max_offdiag_delta),
+            "rho": float(rho_effective),
+            "metric_source": f"{Path(__file__).name}::_compute_metrics",
+            "overrides": overrides,
+            "notes": str(spec.notes),
+        }
+
+    def _log_eval_mode_summary(self, *, always: bool = False) -> None:
+        runtime = dict(self.eval_runtime)
+        summary = (
+            f"[EvalMode] mode={runtime['eval_mode']} "
+            f"| protos={runtime['prototype_source']} "
+            f"| prep={int(runtime['image_preprocessing'])} "
+            f"| align={int(runtime['alignment'])} "
+            f"| dualtrack={int(runtime['dual_track'])} "
+            f"| cache={int(runtime['cache'])} "
+            f"| guardian={int(runtime['guardian'])} "
+            f"| prior={int(runtime['prior_correction'])} "
+            f"| calib={int(runtime['calibration'])} "
+            f"| scale={int(runtime['runtime_scale'])}"
+        )
+        self._log(summary, always=always)
+        for item in runtime.get("overrides", []):
+            self._log(
+                f"[EvalMode][Override] {item['name']}: requested={item['requested']} -> "
+                f"effective={item['effective']} ({item['reason']})",
+                always=always,
+            )
+
+    def _mode_uses_image_preprocessing(self) -> bool:
+        return bool(self.eval_runtime.get("image_preprocessing", False))
+
+    def _mode_uses_alignment(self) -> bool:
+        return bool(self.eval_runtime.get("alignment", False))
+
+    def _mode_uses_test_time_adaptation(self) -> bool:
+        return bool(self.eval_runtime.get("test_time_adaptation", False))
+
+    def _mode_uses_guarded_alignment(self) -> bool:
+        return bool(self.eval_runtime.get("guarded_alignment", False))
+
+    def _mode_uses_prior_correction(self) -> bool:
+        return bool(self.eval_runtime.get("prior_correction", False))
+
+    def _mode_uses_calibration(self) -> bool:
+        return bool(self.eval_runtime.get("calibration", False))
+
+    def _mode_uses_runtime_scale(self) -> bool:
+        return bool(self.eval_runtime.get("runtime_scale", False))
+
+    def _effective_prior_strength(self) -> float:
+        return float(self.eval_runtime.get("prior_strength", 0.0))
+
+    def _effective_fusion_lambda(self) -> float:
+        return float(self.eval_runtime.get("fusion_lambda", 1.0))
+
+    def _effective_rho(self) -> float:
+        return float(self.eval_runtime.get("rho", getattr(self.config, "RHO", 0.85)))
+
+    def _effective_gate_max_offdiag_delta(self) -> float:
+        return float(self.eval_runtime.get("gate_max_offdiag_delta", getattr(self.config, "GATE_MAX_OFFDIAG_DELTA", 0.0)))
+
+    def _effective_eval_scale(self) -> float:
+        return float(self.s_opt) if self._mode_uses_runtime_scale() else 1.0
+
     def _uses_dual_track_inference(self) -> bool:
-        return True
+        return bool(self.eval_runtime.get("dual_track", False))
     
     def _init_clip_model(self):
         model_dir = self.config.LOCAL_MODEL_PATH
@@ -960,6 +1556,9 @@ class CAPA5NotebookRunner:
         self.zI_mean = None; self.zT_mean = None; self.W_zca = None
         self.T_opt = self.config.INIT_TEMPERATURE
         self.s_opt = self.config.INIT_SCALE_FACTOR
+        self.t_raw_text = None
+        self.t_processed_text = None
+        self.t_aligned_text = None
         self.t_raw_pooled = None
         self.t_raw_pooled_raw = None  # store unwhitened text prototypes for raw-space geometry reporting
         self.t_zero_shot_base = None
@@ -1198,6 +1797,92 @@ class CAPA5NotebookRunner:
         if self.config.USE_ZCA_WHITEN and self.W_zca is not None:
             z_centered = torch.matmul(z_centered, self.W_zca)
         return self._l2_norm(z_centered)
+
+    def _prepare_shared_feature_space(self) -> Optional[torch.Tensor]:
+        z_cal = None
+        self.zI_mean = None
+        self.W_zca = None
+        if self._mode_uses_image_preprocessing():
+            self._log("[Stage I] Shared preprocessing calibration")
+            z_cal, _, _ = self._load_data(
+                self.config.CALIB_DATA_PATH,
+                is_calibration=True,
+                split_override=1,
+            )
+            self.zI_mean = z_cal.mean(dim=0, keepdim=True)
+            d_feat = int(z_cal.shape[1])
+            n_cal = int(len(z_cal))
+            min_cov_n = max(2, d_feat + 1)
+            if self.config.USE_ZCA_WHITEN and n_cal >= min_cov_n:
+                cov = torch.matmul((z_cal - self.zI_mean).T, (z_cal - self.zI_mean)) / max(1, (n_cal - 1))
+                try:
+                    U, S, Vh = torch.linalg.svd(cov)
+                    self.W_zca = torch.matmul(torch.matmul(U, torch.diag(1.0 / torch.sqrt(S + 1e-5))), Vh)
+                except RuntimeError as e:
+                    self.W_zca = torch.eye(d_feat, device=self.device)
+                    self._log(f"[Stage I] Whitening SVD failed ({e}); fallback to identity.", always=True)
+            else:
+                self.W_zca = torch.eye(d_feat, device=self.device)
+                if self.config.USE_ZCA_WHITEN:
+                    self._log(
+                        f"[Stage I] Whitening skipped: n={n_cal} < d+1={min_cov_n}; fallback to identity.",
+                        always=True,
+                    )
+        else:
+            self._log("[Stage I] Shared preprocessing disabled by eval_mode.", always=True)
+
+        self._build_prototypes()
+        proto_ref = self.t_raw_text
+        if self._mode_uses_image_preprocessing() and isinstance(self.t_processed_text, torch.Tensor):
+            proto_ref = self.t_processed_text
+        if not isinstance(proto_ref, torch.Tensor):
+            raise RuntimeError("Prototype build failed; missing raw/processed text prototypes.")
+
+        d = int(proto_ref.shape[1])
+        n_cls = int(proto_ref.shape[0])
+        self.current_R = torch.eye(d, device=self.device)
+        self.R_frozen = torch.eye(d, device=self.device)
+        self.image_centroids = proto_ref.clone()
+        self.support_counts = torch.zeros(n_cls, device=self.device)
+        self.rejected_counts = torch.zeros_like(self.support_counts)
+        self.prior_counts = torch.zeros_like(self.support_counts)
+        self.t_align_base = proto_ref.clone()
+        self._set_prior_bias_from_counts(self.prior_counts)
+        self._snapshot_last_good_state()
+        self._refresh_aligned_text()
+
+        if isinstance(z_cal, torch.Tensor):
+            z_cal_proc = self._apply_preprocessing(z_cal, self.zI_mean)
+            self._apply_param_profile_from_calibration(z_cal_proc)
+        return z_cal
+
+    def _prepare_eval_embeddings(self, z_embed: torch.Tensor) -> torch.Tensor:
+        if self._mode_uses_image_preprocessing():
+            return self._apply_preprocessing(z_embed, self.zI_mean)
+        return z_embed.clone()
+
+    def _get_eval_prototype_bundle(self) -> Tuple[torch.Tensor, Optional[torch.Tensor], str]:
+        mode = self._current_eval_mode()
+        if mode == "raw_baseline":
+            if not isinstance(self.t_raw_text, torch.Tensor):
+                raise RuntimeError("raw_baseline requires t_raw_text.")
+            return self.t_raw_text.clone(), None, "t_raw_text"
+        if mode == "preprocessed_baseline":
+            if not isinstance(self.t_processed_text, torch.Tensor):
+                raise RuntimeError("preprocessed_baseline requires t_processed_text.")
+            return self.t_processed_text.clone(), None, "t_processed_text"
+
+        aligned = self._refresh_aligned_text()
+        if not isinstance(aligned, torch.Tensor):
+            raise RuntimeError(f"{mode} requires aligned text prototypes.")
+        baseline_t = self.t_processed_text.clone() if isinstance(self.t_processed_text, torch.Tensor) else None
+        return aligned.clone(), baseline_t, "t_aligned_text"
+
+    def _set_eval_bias_for_prototypes(self, t_protos: torch.Tensor) -> None:
+        if self._mode_uses_prior_correction() and isinstance(self.prior_counts, torch.Tensor):
+            self._set_prior_bias_from_counts(self.prior_counts)
+            return
+        self.b_c = torch.zeros((1, int(t_protos.shape[0])), device=self.device)
 
     def _select_prompt_coreset_indices(self, embeds: torch.Tensor, k: int) -> List[int]:
         n = int(embeds.shape[0])
@@ -1506,15 +2191,41 @@ class CAPA5NotebookRunner:
             chosen = chosen[:target_m]
         return proto_raw, proto_proc, chosen
 
+    def _get_mode_alignment_reference(self) -> Optional[torch.Tensor]:
+        if self._mode_uses_image_preprocessing() and isinstance(self.t_processed_text, torch.Tensor):
+            return self.t_processed_text
+        if isinstance(self.t_raw_text, torch.Tensor):
+            return self.t_raw_text
+        if isinstance(self.t_processed_text, torch.Tensor):
+            return self.t_processed_text
+        return None
+
     def _get_alignment_text_base(self) -> torch.Tensor:
+        expected_base = self._get_mode_alignment_reference()
         if (
             self.t_align_base is not None
-            and self.t_raw_pooled is not None
+            and expected_base is not None
             and isinstance(self.t_align_base, torch.Tensor)
-            and tuple(self.t_align_base.shape) == tuple(self.t_raw_pooled.shape)
+            and tuple(self.t_align_base.shape) == tuple(expected_base.shape)
         ):
             return self.t_align_base
-        return self.t_raw_pooled
+        return expected_base
+
+    def _sync_named_prototypes(self) -> None:
+        self.t_raw_text = self.t_raw_pooled_raw.clone() if isinstance(self.t_raw_pooled_raw, torch.Tensor) else None
+        self.t_processed_text = self.t_raw_pooled.clone() if isinstance(self.t_raw_pooled, torch.Tensor) else None
+        self.t_aligned_text = None
+
+    def _refresh_aligned_text(self) -> Optional[torch.Tensor]:
+        base = self._get_alignment_text_base()
+        if not isinstance(base, torch.Tensor):
+            self.t_aligned_text = None
+            return None
+        if isinstance(self.R_frozen, torch.Tensor):
+            self.t_aligned_text = self._l2_norm(torch.matmul(base, self.R_frozen.T))
+        else:
+            self.t_aligned_text = base.clone()
+        return self.t_aligned_text
 
     def _build_prototypes(self):
         classes = self.config.ORDERED_CLASS_NAMES
@@ -1613,7 +2324,9 @@ class CAPA5NotebookRunner:
 
             self.t_raw_pooled_raw = torch.stack(final_raw_list)
             self.t_raw_pooled = torch.stack(final_proc_list)
-            self.t_align_base = self.t_raw_pooled.clone()
+            base_ref = self._get_mode_alignment_reference()
+            self.t_align_base = base_ref.clone() if isinstance(base_ref, torch.Tensor) else self.t_raw_pooled.clone()
+            self._sync_named_prototypes()
             self.cache_keys = None
             self.cache_labels = None
             self.cache_is_multi = False
@@ -1671,7 +2384,9 @@ class CAPA5NotebookRunner:
 
         self.t_raw_pooled_raw = torch.stack(final_raw_list)
         self.t_raw_pooled = torch.stack(final_proc_list)
-        self.t_align_base = self.t_raw_pooled.clone()
+        base_ref = self._get_mode_alignment_reference()
+        self.t_align_base = base_ref.clone() if isinstance(base_ref, torch.Tensor) else self.t_raw_pooled.clone()
+        self._sync_named_prototypes()
         self.cache_keys = None
         self.cache_labels = None
         self.cache_is_multi = False
@@ -1683,7 +2398,7 @@ class CAPA5NotebookRunner:
         self.t_paraphrases = [self._l2_norm(t_reshaped_proc[:, m, :]) for m in range(self.config.M)]
 
     def _set_prior_bias_from_counts(self, counts: torch.Tensor):
-        tau_prior = float(getattr(self.config, "TAU_PRIOR", 0.0))
+        tau_prior = self._effective_prior_strength()
         if tau_prior <= 0.0:
             self.b_c = torch.zeros((1, self.t_raw_pooled.shape[0]), device=self.device)
             return
@@ -1816,6 +2531,8 @@ class CAPA5NotebookRunner:
     def _apply_param_profile_from_calibration(self, z_cal_proc: torch.Tensor):
         if not self._is_professor_profile():
             return
+        if not self._mode_uses_runtime_scale():
+            return
         if z_cal_proc is None or z_cal_proc.numel() == 0:
             return
 
@@ -1842,7 +2559,7 @@ class CAPA5NotebookRunner:
         )
 
     def _is_go_guardian_enabled(self) -> bool:
-        return bool(getattr(self.config, "ENABLE_GO_GUARDIAN", False))
+        return bool(self.eval_runtime.get("guardian", False))
 
     def _guardian_is_frozen(self) -> bool:
         return str(self.guardian_status) == "frozen"
@@ -2091,11 +2808,11 @@ class CAPA5NotebookRunner:
         return pos_term - neg_term
 
     def _is_cache_enabled(self) -> bool:
-        return str(getattr(self.config, "CACHE_MODE", "off")).strip().lower() == "gated"
+        return bool(self.eval_runtime.get("cache", False))
 
     def _default_cache_eval_info(self) -> Dict[str, float]:
         return {
-            "mode": str(getattr(self.config, "CACHE_MODE", "off")).strip().lower(),
+            "mode": str(self.eval_runtime.get("cache_mode", "off")),
             "dataset_gate": False,
             "psi_top1": np.nan,
             "psi_topk_mean": np.nan,
@@ -2396,9 +3113,9 @@ class CAPA5NotebookRunner:
         return out
 
     def _is_soft_fusion_enabled(self) -> bool:
-        if not bool(getattr(self.config, "ENABLE_CAPA_BASELINE_SOFT_FUSION", False)):
+        if not bool(self.eval_runtime.get("soft_fusion", False)):
             return False
-        lam = float(getattr(self.config, "CAPA_BASELINE_FUSION_LAMBDA", 1.0))
+        lam = self._effective_fusion_lambda()
         return 0.0 <= lam < 1.0
 
     def _fuse_with_baseline_logits(
@@ -2413,7 +3130,7 @@ class CAPA5NotebookRunner:
             return logits_capa
         if not self._is_soft_fusion_enabled():
             return logits_capa
-        lam = min(1.0, max(0.0, float(getattr(self.config, "CAPA_BASELINE_FUSION_LAMBDA", 1.0))))
+        lam = min(1.0, max(0.0, self._effective_fusion_lambda()))
         logits_base = scale * torch.matmul(z_embed, baseline_t_protos.T) + self.b_c
         n_use = min(int(logits_capa.shape[1]), int(logits_base.shape[1]))
         if n_use <= 0:
@@ -2518,6 +3235,8 @@ class CAPA5NotebookRunner:
         T = 1.0 if ranking else max(float(calib_T), 1e-4)
 
         if is_multi:
+            if ranking:
+                return logits / T
             if mode == "mixed":
                 return torch.sigmoid(logits / T)
             return F.softmax(logits / T, dim=1)
@@ -2525,6 +3244,8 @@ class CAPA5NotebookRunner:
         pos_indices = self._get_binary_positive_indices(dataset_name, logits.shape[1])
         if mode == "mixed":
             bin_logit = self._binary_logit_from_multiclass(logits / T, pos_indices)
+            if ranking:
+                return bin_logit
             return torch.sigmoid(bin_logit)
 
         probs_full = F.softmax(logits / T, dim=1)
@@ -2944,18 +3665,18 @@ class CAPA5NotebookRunner:
             q = min(1.0, max(0.0, float(getattr(self.config, "RHO_QUANTILE", 0.70))))
             rho_eff = float(torch.quantile(sim_before_vec.detach(), q).item())
         else:
-            rho_eff = float(self.config.RHO)
+            rho_eff = self._effective_rho()
         if not np.isfinite(rho_eff):
-            rho_eff = float(self.config.RHO)
+            rho_eff = self._effective_rho()
 
-        offdiag_limit = float(getattr(self.config, "GATE_MAX_OFFDIAG_DELTA", 0.0))
+        offdiag_limit = self._effective_gate_max_offdiag_delta()
         gain_frac = max(0.0, float(getattr(self.config, "CAPAV1_DYNAMIC_OFFDIAG_FRAC", 0.30)))
         adaptive_limit = gain_frac * max(delta, 0.0)
         if offdiag_limit > 0.0:
             offdiag_limit = max(0.0, min(offdiag_limit, adaptive_limit) if adaptive_limit > 0.0 else offdiag_limit)
         else:
             offdiag_limit = max(0.0, adaptive_limit)
-        if bool(getattr(self.config, "GATE_REQUIRE_OFFDIAG_IMPROVEMENT", True)):
+        if bool(self.eval_runtime.get("offdiag_gate", False)):
             offdiag_ok = off_diag_delta <= offdiag_limit
         else:
             offdiag_ok = True
@@ -3092,6 +3813,7 @@ class CAPA5NotebookRunner:
             "psi_bin_edges": self.guardian_psi_bin_edges,
             "baseline_samples": int(len(self.guardian_baseline_values)),
         }
+        aligned_text = self._refresh_aligned_text()
         state_dict = {
             "line_mode": "capav1_gt",
             "centroids": self.image_centroids.cpu(),
@@ -3106,6 +3828,9 @@ class CAPA5NotebookRunner:
             "t_align_base": T_base.detach().cpu(),
             "t_mixed": T_base.detach().cpu(),
             "t_raw_pooled": self.t_raw_pooled.detach().cpu(),
+            "t_raw_text": self.t_raw_text.detach().cpu() if isinstance(self.t_raw_text, torch.Tensor) else None,
+            "t_processed_text": self.t_processed_text.detach().cpu() if isinstance(self.t_processed_text, torch.Tensor) else None,
+            "t_aligned_text": aligned_text.detach().cpu() if isinstance(aligned_text, torch.Tensor) else None,
             "guardian": guardian_blob,
         }
         with open(state_path, "wb") as f:
@@ -3317,6 +4042,7 @@ class CAPA5NotebookRunner:
         self.current_R = R_cand
         self.R_frozen = R_cand
         self._snapshot_last_good_state()
+        self._refresh_aligned_text()
 
         t_base_eval = self._get_alignment_text_base()
         T_rot = torch.matmul(t_base_eval, R_cand.T)
@@ -3339,46 +4065,16 @@ class CAPA5NotebookRunner:
             "soft_fallback": bool(stats.get("soft_fallback", False)),
         }
 
-    def run_pipeline(self):
-        self._log("[Stage I] Calibration")
-        z_cal, _, _ = self._load_data(
-            self.config.CALIB_DATA_PATH,
-            is_calibration=True,
-            split_override=1,
-        )
-        self.zI_mean = z_cal.mean(dim=0, keepdim=True)
-        d_feat = int(z_cal.shape[1])
-        n_cal = int(len(z_cal))
-        min_cov_n = max(2, d_feat + 1)
-        if self.config.USE_ZCA_WHITEN and n_cal >= min_cov_n:
-            cov = torch.matmul((z_cal - self.zI_mean).T, (z_cal - self.zI_mean)) / max(1, (n_cal - 1))
-            try:
-                U, S, Vh = torch.linalg.svd(cov)
-                self.W_zca = torch.matmul(torch.matmul(U, torch.diag(1.0 / torch.sqrt(S + 1e-5))), Vh)
-            except RuntimeError as e:
-                self.W_zca = torch.eye(d_feat, device=self.device)
-                self._log(f"[Stage I] Whitening SVD failed ({e}); fallback to identity.", always=True)
-        else:
-            self.W_zca = torch.eye(d_feat, device=self.device)
-            if self.config.USE_ZCA_WHITEN:
-                self._log(
-                    f"[Stage I] Whitening skipped: n={n_cal} < d+1={min_cov_n}; fallback to identity.",
-                    always=True,
-                )
-        self._build_prototypes()
+    def run_pipeline(self, *, run_stage4: bool = True):
+        z_cal = self._prepare_shared_feature_space()
+        if not self._mode_uses_alignment():
+            # Legacy deployment-only evaluation sweep kept dormant for the two-mode main path.
+            if run_stage4 and self._mode_uses_guarded_alignment():
+                self._run_evaluation()
+                self._run_scale_sweep([8, 12, 16, 24, 32, 40])
+            return
 
-        d = self.t_raw_pooled.shape[1]
-        self.current_R = torch.eye(d, device=self.device)
-        self.R_frozen = torch.eye(d, device=self.device)
-        self.image_centroids = self.t_raw_pooled.clone()
-        self.support_counts = torch.zeros(self.t_raw_pooled.shape[0], device=self.device)
-        self.rejected_counts = torch.zeros_like(self.support_counts)
-        self.prior_counts = torch.zeros_like(self.support_counts)
-        self.t_align_base = self.t_raw_pooled.clone()
-        self._set_prior_bias_from_counts(self.prior_counts)
-        self._snapshot_last_good_state()
-        z_cal_proc = self._apply_preprocessing(z_cal, self.zI_mean)
-        self._apply_param_profile_from_calibration(z_cal_proc)
+        d = self.t_raw_text.shape[1]
 
         # GO Guardian baseline is collected online after GO warmup steps.
         self.guardian_status = "off"
@@ -3402,7 +4098,7 @@ class CAPA5NotebookRunner:
 
         self._log(f"[Stage III] GT Support Adaptation (warmup={self.config.WARMUP_BATCHES} batches)")
         z_train, y_train, _ = self._load_data(self.config.TRAIN_DATA_PATH, split_override=0)
-        z_train = self._apply_preprocessing(z_train, self.zI_mean)
+        z_train = self._prepare_eval_embeddings(z_train)
         if y_train is None:
             raise RuntimeError("capav1_gt requires labels in TRAIN_DATA_PATH for GT evidence routing.")
         
@@ -3428,8 +4124,9 @@ class CAPA5NotebookRunner:
                 
             t_base = self._get_alignment_text_base()
             t_aligned = self._l2_norm(torch.matmul(t_base, R_inference.T))
-            logits = self.s_opt * torch.matmul(z_b, t_aligned.T) + self.b_c
-            probs = torch.sigmoid(logits / self.T_opt)
+            logits = self._effective_eval_scale() * torch.matmul(z_b, t_aligned.T) + self.b_c
+            train_T = self.T_opt if self._mode_uses_calibration() else 1.0
+            probs = torch.sigmoid(logits / max(float(train_T), 1e-4))
 
             g_info = self._guardian_update_from_window(step, probs)
             if g_info is not None and bool(g_info.get("changed", False)):
@@ -3514,15 +4211,26 @@ class CAPA5NotebookRunner:
                     if self.config.VERBOSE and (step % 10 == 0 or step == self.config.WARMUP_BATCHES):
                         tqdm.write(f" [Gate Held] Too few active classes ({n_act}/{n_total}). Need at least {MIN_CLASSES_FOR_ADAPTATION}.")
                 else:
-                    self.t_align_base = self.t_raw_pooled.clone()
+                    base_ref = self._get_mode_alignment_reference()
+                    self.t_align_base = base_ref.clone() if isinstance(base_ref, torch.Tensor) else self._get_alignment_text_base().clone()
                     # 鏈夎冻澶熺被鍒椂锛岃绠?R锛坃solve_procrustes 鍐呴儴浼氳嚜鍔ㄥ拷鐣ユ牱鏈笉瓒崇殑绫诲埆锛?
                     R_full = self._solve_procrustes()
-                    R_cand, stats = self._select_guarded_alignment_candidate(
-                        R_full,
-                        step,
-                        phase=phase_name,
-                        allow_soft_fallback=True,
-                    )
+                    if self._mode_uses_guarded_alignment():
+                        R_cand, stats = self._select_guarded_alignment_candidate(
+                            R_full,
+                            step,
+                            phase=phase_name,
+                            allow_soft_fallback=True,
+                        )
+                    else:
+                        R_cand = R_full
+                        stats = self._diagnose_and_log_dynamic(R_full, step, phase=phase_name, emit_log=False)
+                        stats["alpha"] = 1.0
+                        stats["selection_mode"] = "pure_full"
+                        stats["mix_base"] = "full"
+                        stats["score"] = self._alignment_stats_score(stats)
+                        stats["soft_fallback"] = False
+                        stats["passed"] = True
                     pbar_metrics.update(
                         {
                             "dS": f"{stats['dS']:.4f}",
@@ -3534,28 +4242,26 @@ class CAPA5NotebookRunner:
                     
                     if stats["passed"]:
                         self._commit_alignment_candidate(R_cand, stats, gate_pass=True)
-                        
-                        # 鍒嗗眰鍐荤粨绛栫暐锛?
-                        # 1. 濡傛灉瑕嗙洊鐜囬珮锛?80%锛変笖鎸囨爣鍚堟牸 鈫?褰诲簳鍐荤粨閫€鍑?
-                        # 2. 鍚﹀垯鍙洿鏂板弬鏁帮紝缁х画鏀堕泦鏇村绫诲埆鐨勬暟鎹?
                         coverage_ratio = n_act / n_total
-                        if coverage_ratio >= 0.8:
-                            if bool(getattr(self.config, "AUDIT_DISABLE_EARLY_FREEZE", False)):
-                                self._log(
-                                    f"[Gate Passed][Audit] Early freeze suppressed at step={step} "
-                                    f"(coverage={coverage_ratio:.1%}, 螖s={stats['dS']:.4f}); continuing full train pass."
-                                )
+                        if self._mode_uses_guarded_alignment():
+                            if coverage_ratio >= 0.8:
+                                if bool(getattr(self.config, "AUDIT_DISABLE_EARLY_FREEZE", False)):
+                                    self._log(
+                                        f"[Gate Passed][Audit] Early freeze suppressed at step={step} "
+                                        f"(coverage={coverage_ratio:.1%}, 螖s={stats['dS']:.4f}); continuing full train pass."
+                                    )
+                                else:
+                                    self.is_frozen = True
+                                    pbar.set_postfix(pbar_metrics)
+                                    self._log(f"[Gate Passed] Freeze R at step={step} (coverage={coverage_ratio:.1%}, 螖s={stats['dS']:.4f})")
+                                    self._save_and_report_per_class()
+                                    saved_state = True
+                                    pbar.close()
+                                    break
                             else:
-                                self.is_frozen = True
-                                pbar.set_postfix(pbar_metrics)
-                                self._log(f"[Gate Passed] Freeze R at step={step} (coverage={coverage_ratio:.1%}, 螖s={stats['dS']:.4f})")
-                                self._save_and_report_per_class()
-                                saved_state = True
-                                pbar.close()
-                                break
+                                self._log(f" [Update] R updated with {n_act}/{n_total} classes ({coverage_ratio:.1%}).")
                         else:
-                            # 鍙傛暟鏇存柊浣嗕笉鍐荤粨锛岀户缁€傚簲
-                            self._log(f" [Update] R updated with {n_act}/{n_total} classes ({coverage_ratio:.1%}).")
+                            self._log(f" [PureCAPA] Updated aligned R with {n_act}/{n_total} classes ({coverage_ratio:.1%}).")
                     elif bool(stats.get("soft_fallback", False)):
                         soft_score = float(stats.get("score", self._alignment_stats_score(stats)))
                         if soft_score > best_soft_candidate_score:
@@ -3574,7 +4280,7 @@ class CAPA5NotebookRunner:
                 pbar.set_postfix(pbar_metrics)
             
         if not self.is_frozen:
-            if isinstance(best_soft_candidate_R, torch.Tensor) and isinstance(best_soft_candidate_stats, dict):
+            if self._mode_uses_guarded_alignment() and isinstance(best_soft_candidate_R, torch.Tensor) and isinstance(best_soft_candidate_stats, dict):
                 self._commit_alignment_candidate(best_soft_candidate_R, best_soft_candidate_stats, gate_pass=False)
                 self._log(
                     f"[WARN] Loop finished without freezing; using best GT soft fallback "
@@ -3589,11 +4295,14 @@ class CAPA5NotebookRunner:
                 self._snapshot_last_good_state()
         final_prior_counts = self.prior_counts if self.prior_counts is not None else self.support_counts
         self._set_prior_bias_from_counts(final_prior_counts)
+        self._refresh_aligned_text()
         if not saved_state:
             self._save_and_report_per_class()
 
-        self._run_evaluation()
-        self._run_scale_sweep([8, 12, 16, 24, 32, 40])
+        # Legacy deployment-only evaluation sweep kept dormant for the two-mode main path.
+        if run_stage4 and self._mode_uses_guarded_alignment():
+            self._run_evaluation()
+            self._run_scale_sweep([8, 12, 16, 24, 32, 40])
 
     def _compute_ece(self, y_true, y_prob, n_bins=10):
         """
@@ -3665,43 +4374,43 @@ class CAPA5NotebookRunner:
         }
 
         if is_multi:
-            probs = self._predict_probs(
+            probs_rank = self._predict_probs(
+                logits, calib_T=1.0, is_multi=True, dataset_name=dataset_name, scoring_mode=mode, ranking=True
+            ).cpu().numpy()
+            probs_cal = self._predict_probs(
                 logits, calib_T=calib_T, is_multi=True, dataset_name=dataset_name, scoring_mode=mode, ranking=False
             ).cpu().numpy()
-            stats["Top1_Median"] = np.median(probs.max(axis=1))
+            stats["Top1_Median"] = np.median(probs_cal.max(axis=1))
 
             try:
                 if y_test.ndim != 2:
                     raise ValueError(f"Expected multilabel y_test as 2D array, got shape={getattr(y_test, 'shape', None)}")
                 n_labels = int(y_test.shape[1])
-                n_proto = int(probs.shape[1])
+                n_proto = int(probs_rank.shape[1])
                 n_eval = max(1, min(n_labels, n_proto))
 
                 # Assume label columns align with ORDERED_CLASS_NAMES[:n_eval]
                 eval_indices = list(range(n_eval))
-                probs_eval = probs[:, eval_indices]
+                probs_rank_eval = probs_rank[:, eval_indices]
+                probs_cal_eval = probs_cal[:, eval_indices]
                 y_eval = y_test[:, eval_indices]
 
-                aucs = [roc_auc_score(y_eval[:, i], probs_eval[:, i])
+                aucs = [roc_auc_score(y_eval[:, i], probs_rank_eval[:, i])
                         for i in range(n_eval) if len(np.unique(y_eval[:, i])) > 1]
                 if aucs:
                     stats["Macro-AUC"] = np.mean(aucs)
                 try:
-                    stats["Micro-AUC"] = roc_auc_score(y_eval, probs_eval, average="micro")
+                    stats["Micro-AUC"] = roc_auc_score(y_eval, probs_rank_eval, average="micro")
                 except Exception:
                     pass
 
-                stats["ECE"] = self._compute_ece(y_eval, probs_eval)
-                stats["Acc"] = f1_score(y_eval, (probs_eval > 0.5).astype(int), average="macro", zero_division=0)
-                stats["Brier"] = float(np.mean((probs_eval - y_eval) ** 2))
+                stats["ECE"] = self._compute_ece(y_eval, probs_cal_eval)
+                stats["Acc"] = f1_score(y_eval, (probs_cal_eval > 0.5).astype(int), average="macro", zero_division=0)
+                stats["Brier"] = float(np.mean((probs_cal_eval - y_eval) ** 2))
 
                 if "DEBUG_AUC_CHECK" in os.environ:
-                    probs_T1 = self._predict_probs(
-                        logits, calib_T=1.0, is_multi=True, dataset_name=dataset_name, scoring_mode=mode, ranking=True
-                    ).cpu().numpy()
                     try:
-                        probs_T1 = probs_T1[:, eval_indices]
-                        aucs_T1 = [roc_auc_score(y_eval[:, i], probs_T1[:, i])
+                        aucs_T1 = [roc_auc_score(y_eval[:, i], probs_rank_eval[:, i])
                                    for i in range(n_eval) if len(np.unique(y_eval[:, i])) > 1]
                         if aucs_T1 and not np.isnan(stats["Macro-AUC"]):
                             assert abs(np.mean(aucs_T1) - stats["Macro-AUC"]) < 2e-3, "AUC changed unexpectedly after calibration!"
@@ -3848,8 +4557,14 @@ class CAPA5NotebookRunner:
         self.guardian_psi_bin_edges = guardian_state.get("psi_bin_edges", None)
 
         if self.t_align_base is None:
-            self.t_align_base = self.t_raw_pooled.clone()
+            base_ref = self._get_mode_alignment_reference()
+            self.t_align_base = base_ref.clone() if isinstance(base_ref, torch.Tensor) else self.t_raw_pooled.clone()
         self._set_prior_bias_from_counts(self.prior_counts if self.prior_counts is not None else counts)
+        if isinstance(state.get("t_raw_text", None), torch.Tensor):
+            self.t_raw_text = state["t_raw_text"].to(self.device)
+        if isinstance(state.get("t_processed_text", None), torch.Tensor):
+            self.t_processed_text = state["t_processed_text"].to(self.device)
+        self._refresh_aligned_text()
         return state
 
     def _predict_dataset_branch_outputs(
@@ -4217,7 +4932,8 @@ class CAPA5NotebookRunner:
                 if isinstance(rejected_counts, torch.Tensor)
                 else torch.zeros_like(self.support_counts)
             )
-            self.t_align_base = self.t_raw_pooled.clone()
+            base_ref = self._get_mode_alignment_reference()
+            self.t_align_base = base_ref.clone() if isinstance(base_ref, torch.Tensor) else self.t_raw_pooled.clone()
             self._set_prior_bias_from_counts(self.prior_counts)
             R_full = self._solve_procrustes()
             R_sel, stats = self._select_guarded_alignment_candidate(
@@ -4319,6 +5035,227 @@ class CAPA5NotebookRunner:
             else:
                 lo = mid
         return best_tau, best_nll
+
+    def _iter_selected_test_datasets(self, datasets: Optional[List[str]] = None) -> List[Tuple[str, str]]:
+        requested = None
+        if datasets:
+            requested = {self._canonical_dataset_name(item) for item in datasets}
+        selected: List[Tuple[str, str]] = []
+        for name, path in self.config.TEST_DATA_PATHS.items():
+            canonical = self._canonical_dataset_name(name)
+            if requested is not None and canonical not in requested:
+                continue
+            selected.append((canonical or str(name), path))
+        if requested is not None and not selected:
+            raise ValueError(f"No datasets matched {datasets}. Available: {list(self.config.TEST_DATA_PATHS)}")
+        return selected
+
+    def _fit_eval_temperature(
+        self,
+        dataset_name: str,
+        *,
+        t_eval: torch.Tensor,
+        baseline_t_protos: Optional[torch.Tensor],
+        scoring_mode: Optional[str] = None,
+    ) -> float:
+        if not self._mode_uses_calibration():
+            return 1.0
+
+        z_tau_raw, y_tau, is_multi_tau = self._load_data(
+            self.config.TAU_CALIB_DATA_PATH,
+            is_calibration=True,
+            split_override=1,
+        )
+        if y_tau is None:
+            raise RuntimeError(f"TAU calibration set has no labels: {self.config.TAU_CALIB_DATA_PATH}")
+
+        z_tau = self._prepare_eval_embeddings(z_tau_raw)
+        g_cpu_tau = torch.Generator()
+        g_cpu_tau.manual_seed(self.config.RANDOM_SEED)
+        perm_tau = torch.randperm(len(z_tau), generator=g_cpu_tau)
+        z_tau = z_tau[perm_tau]
+        if isinstance(y_tau, np.ndarray):
+            y_tau = y_tau[perm_tau.cpu().numpy()]
+
+        n_tau_total = len(z_tau)
+        n_tau = max(1, int(self.config.TAU_CALIB_FRAC * n_tau_total))
+        if n_tau_total >= 2500:
+            n_tau = min(self.config.TAU_CALIB_MAX, max(self.config.TAU_CALIB_MIN, n_tau))
+        z_tau = z_tau[:n_tau]
+        y_tau = y_tau[:n_tau]
+
+        self._set_eval_bias_for_prototypes(t_eval)
+        logits_tau = self._compose_eval_logits(
+            z_tau,
+            t_eval,
+            scale=self._effective_eval_scale(),
+            baseline_t_protos=baseline_t_protos,
+        ).cpu().numpy()
+        tau_cal, _ = self._fit_posthoc_tau(
+            logits_tau,
+            np.asarray(y_tau),
+            dataset_name=dataset_name,
+            is_multi=bool(is_multi_tau),
+            scoring_mode=scoring_mode,
+        )
+        return float(tau_cal)
+
+    def _build_eval_audit_summary(
+        self,
+        *,
+        dataset_name: str,
+        dataset_path: str,
+        split_override: int,
+        prototype_source: str,
+        temperature: float,
+        scale: float,
+        run_dir: str,
+    ) -> Dict[str, object]:
+        return {
+            "eval_mode": self._current_eval_mode(),
+            "entry_script": str(getattr(self.config, "ENTRY_SCRIPT", ENTRY_SCRIPT_PATH)),
+            "dataset": str(dataset_name),
+            "dataset_path": str(dataset_path),
+            "split": int(split_override),
+            "backbone": str(self.config.MODEL_NAME),
+            "train_data_path": str(getattr(self.config, "TRAIN_DATA_PATH", "")),
+            "cross_modal_data_path": str(getattr(self.config, "CROSS_MODAL_DATA_PATH", "")),
+            "calib_data_path": str(getattr(self.config, "CALIB_DATA_PATH", "")),
+            "tau_calib_data_path": str(getattr(self.config, "TAU_CALIB_DATA_PATH", "")),
+            "data_semantics": {
+                "train": "CheXpert-5 target-aware view materialized from data_train.pkl for CAPA adaptation/training",
+                "test": "dataset-specific zero-shot evaluation file",
+                "cross_modal": "CHEXPERT_MIMIC.pkl for cross-modal retrieval analysis",
+                "calibration": "target-aware image-only calibration subset materialized from data_train.pkl",
+            },
+            "prototype_source": str(prototype_source),
+            "preprocessing_on": bool(self._mode_uses_image_preprocessing()),
+            "alignment_on": bool(self._mode_uses_alignment()),
+            "cache_on": bool(self._is_cache_enabled()),
+            "dual_track_on": bool(self._uses_dual_track_inference()),
+            "guardian_on": bool(self._is_go_guardian_enabled()),
+            "prior_correction_on": bool(self._mode_uses_prior_correction()),
+            "calibration_on": bool(self._mode_uses_calibration()),
+            "final_logits_source": str(self.eval_runtime.get("final_logits_source", "")),
+            "metric_source": str(self.eval_runtime.get("metric_source", f"{Path(__file__).name}::_compute_metrics")),
+            "run_dir": str(run_dir),
+            "scale": float(scale),
+            "temperature": float(temperature),
+            "notes": str(self.eval_runtime.get("notes", "")),
+        }
+
+    def run_eval_mode_report(
+        self,
+        *,
+        datasets: Optional[List[str]] = None,
+        split_override: int = 2,
+        scoring_mode: Optional[str] = None,
+    ) -> pd.DataFrame:
+        self._init_state()
+        self.eval_runtime = self._build_eval_runtime()
+        self._log_eval_mode_summary(always=True)
+
+        if self._mode_uses_alignment():
+            self.run_pipeline(run_stage4=False)
+        else:
+            self._prepare_shared_feature_space()
+
+        mode = self._current_eval_mode()
+        score_mode = self._resolve_scoring_mode(scoring_mode)
+        t_eval, baseline_t_protos, prototype_source = self._get_eval_prototype_bundle()
+        scale = self._effective_eval_scale()
+        self._log(
+            "[DataLayout] "
+            f"train={self.config.TRAIN_DATA_PATH} | "
+            f"cross_modal={getattr(self.config, 'CROSS_MODAL_DATA_PATH', '')} | "
+            f"calib={self.config.CALIB_DATA_PATH} | "
+            f"tau_calib={self.config.TAU_CALIB_DATA_PATH}",
+            always=True,
+        )
+
+        audit_dir = os.path.join(self.config.SAVE_DIR, "audit")
+        os.makedirs(audit_dir, exist_ok=True)
+        report_rows: List[Dict[str, object]] = []
+
+        for dataset_name, path in self._iter_selected_test_datasets(datasets):
+            if not os.path.exists(path):
+                continue
+            z_test_raw, y_test, is_multi = self._load_data(path, split_override=split_override)
+            if y_test is None:
+                continue
+            z_test = self._prepare_eval_embeddings(z_test_raw)
+            self._set_eval_bias_for_prototypes(t_eval)
+            tau_eval = self._fit_eval_temperature(
+                dataset_name,
+                t_eval=t_eval,
+                baseline_t_protos=baseline_t_protos,
+                scoring_mode=score_mode,
+            )
+            stats = self._compute_metrics(
+                z_test,
+                y_test,
+                is_multi,
+                t_eval,
+                scale_override=scale,
+                temperature_override=tau_eval,
+                dataset_name=dataset_name,
+                scoring_mode=score_mode,
+                use_cache=self._is_cache_enabled(),
+                baseline_t_protos=baseline_t_protos,
+            )
+            audit = self._build_eval_audit_summary(
+                dataset_name=dataset_name,
+                dataset_path=path,
+                split_override=split_override,
+                prototype_source=prototype_source,
+                temperature=tau_eval,
+                scale=scale,
+                run_dir=self.config.SAVE_DIR,
+            )
+            audit_path = os.path.join(audit_dir, f"{mode}_{dataset_name.lower()}_audit.json")
+            with open(audit_path, "w", encoding="utf-8") as f:
+                json.dump(audit, f, indent=2, ensure_ascii=True, default=_json_default)
+
+            row = {
+                "mode": mode,
+                "dataset": dataset_name,
+                "split": int(split_override),
+                "scoring_mode": score_mode,
+                "macro_auc": float(stats.get("Macro-AUC", np.nan)),
+                "micro_auc": float(stats.get("Micro-AUC", np.nan)),
+                "ece": float(stats.get("ECE", np.nan)),
+                "acc": float(stats.get("Acc", np.nan)),
+                "brier": float(stats.get("Brier", np.nan)),
+                "temperature": float(tau_eval),
+                "scale": float(scale),
+                "run_dir": str(self.config.SAVE_DIR),
+                "prototype_source": prototype_source,
+                "final_logits_source": str(audit["final_logits_source"]),
+                "dual_track_used": bool(self.last_dualtrack_eval_info.get("enabled", False)),
+                "cache_used": bool(self._is_cache_enabled()),
+                "guardian_used": bool(self._is_go_guardian_enabled()),
+                "prior_correction_used": bool(self._mode_uses_prior_correction()),
+                "calibration_used": bool(self._mode_uses_calibration()),
+                "notes": str(self.eval_runtime.get("notes", "")),
+                "audit_summary_path": audit_path,
+            }
+            if self.last_dualtrack_eval_info:
+                row["dualtrack_aligned_rate"] = float(self.last_dualtrack_eval_info.get("aligned_rate", np.nan))
+                row["dualtrack_agree_rate"] = float(self.last_dualtrack_eval_info.get("agree_rate", np.nan))
+            if self.last_cache_eval_info:
+                row["cache_usage_rate"] = float(self.last_cache_eval_info.get("usage_rate", 0.0))
+                row["cache_mean_alpha"] = float(self.last_cache_eval_info.get("mean_alpha", 0.0))
+            report_rows.append(row)
+
+        df = pd.DataFrame(report_rows)
+        out_csv = os.path.join(self.config.SAVE_DIR, f"eval_mode_report_{mode}.csv")
+        df.to_csv(out_csv, index=False)
+        out_json = os.path.join(self.config.SAVE_DIR, f"eval_mode_report_{mode}.json")
+        with open(out_json, "w", encoding="utf-8") as f:
+            json.dump(report_rows, f, indent=2, ensure_ascii=True, default=_json_default)
+        self._log(f"[Saved] {out_csv}", always=True)
+        self._log(f"[Saved] {out_json}", always=True)
+        return df
 
     def _get_gate_active_mask(self, n_cls: int) -> torch.Tensor:
         return self._get_alignment_active_mask(n_cls=n_cls)
@@ -4889,7 +5826,8 @@ class CAPA5NotebookRunner:
         self.guardian_psi_bin_edges = guardian_state.get("psi_bin_edges", None)
 
         if self.t_align_base is None:
-            self.t_align_base = self.t_raw_pooled.clone()
+            base_ref = self._get_mode_alignment_reference()
+            self.t_align_base = base_ref.clone() if isinstance(base_ref, torch.Tensor) else self.t_raw_pooled.clone()
 
         eval_scale = float(self.s_opt)
         self._set_prior_bias_from_counts(self.prior_counts if self.prior_counts is not None else counts)
@@ -5535,12 +6473,18 @@ class CAPA5NotebookRunner:
                 cfg_ds.VERBOSE = False
                 cfg_ds.PRINT_SUMMARY = False
                 cfg_ds.TEST_DATA_PATHS = {key: path}
-                # Experimental branch: use same dataset file with split_override logic.
+                # Legacy experimental branch: intentionally rebinds a test file as
+                # train/calib/tau via split_override. This does NOT follow the main
+                # dataset semantics used by eval_mode_report / eval_mode_comparison.
                 cfg_ds.TRAIN_DATA_PATH = path
                 cfg_ds.CALIB_DATA_PATH = path
                 cfg_ds.TAU_CALIB_DATA_PATH = path
                 cfg_ds.SAVE_DIR = os.path.join(self.config.SAVE_DIR, f"per_dataset_capa_{key.lower()}")
                 os.makedirs(cfg_ds.SAVE_DIR, exist_ok=True)
+                self._log(
+                    f"[PerDatasetCAPA][Legacy] Rebinding {path} as train/calib/tau for diagnostic use only.",
+                    always=True,
+                )
 
                 runner_ds = CAPA5NotebookRunner(cfg_ds)
                 runner_ds._build_prototypes()
@@ -6448,6 +7392,141 @@ def run_go_ml_risk_stratified_analysis(config: CAPA5Config) -> Tuple[pd.DataFram
     return df_rows, df_thresh
 
 
+def _clone_config_for_eval_mode(base_config: CAPA5Config, mode: str, save_dir: str) -> CAPA5Config:
+    cfg = copy.deepcopy(base_config)
+    cfg.EVAL_MODE = str(mode)
+    cfg.SAVE_DIR = str(save_dir)
+    cfg.PRINT_SUMMARY = False
+    return cfg
+
+
+def _rows_to_markdown(rows: List[Dict[str, object]], columns: List[str]) -> str:
+    header = "| " + " | ".join(columns) + " |"
+    sep = "| " + " | ".join(["---"] * len(columns)) + " |"
+    body = [header, sep]
+    for row in rows:
+        vals = []
+        for col in columns:
+            val = row.get(col, "")
+            if isinstance(val, float):
+                if np.isnan(val):
+                    vals.append("nan")
+                else:
+                    vals.append(f"{val:.6f}")
+            else:
+                vals.append(str(val).replace("|", "/"))
+        body.append("| " + " | ".join(vals) + " |")
+    return "\n".join(body)
+
+
+def run_eval_mode_comparison(
+    config: CAPA5Config,
+    *,
+    datasets: Optional[List[str]] = None,
+    split_override: int = 2,
+    scoring_mode: Optional[str] = None,
+    include_preprocessed_baseline: bool = False,
+) -> pd.DataFrame:
+    suite_dir = os.path.join(config.SAVE_DIR, "eval_mode_comparison")
+    os.makedirs(suite_dir, exist_ok=True)
+
+    all_rows: List[Dict[str, object]] = []
+    mode_order = EVAL_MODE_ORDER if include_preprocessed_baseline else MAIN_EVAL_MODE_ORDER
+    for mode in mode_order:
+        mode_dir = os.path.join(suite_dir, mode)
+        os.makedirs(mode_dir, exist_ok=True)
+        cfg_mode = _clone_config_for_eval_mode(config, mode, mode_dir)
+        runner = CAPA5NotebookRunner(cfg_mode)
+        df_mode = runner.run_eval_mode_report(
+            datasets=datasets,
+            split_override=split_override,
+            scoring_mode=scoring_mode,
+        )
+        all_rows.extend(df_mode.to_dict(orient="records"))
+
+    df = pd.DataFrame(all_rows)
+    csv_path = os.path.join(suite_dir, "eval_mode_comparison.csv")
+    json_path = os.path.join(suite_dir, "eval_mode_comparison.json")
+    md_path = os.path.join(suite_dir, "eval_mode_comparison.md")
+    df.to_csv(csv_path, index=False)
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(all_rows, f, indent=2, ensure_ascii=True, default=_json_default)
+    md_cols = [
+        "mode",
+        "dataset",
+        "split",
+        "macro_auc",
+        "micro_auc",
+        "ece",
+        "run_dir",
+        "prototype_source",
+        "dual_track_used",
+        "notes",
+    ]
+    with open(md_path, "w", encoding="utf-8") as f:
+        f.write(_rows_to_markdown(all_rows, md_cols))
+        f.write("\n")
+    print(f"[Saved] {csv_path}")
+    print(f"[Saved] {json_path}")
+    print(f"[Saved] {md_path}")
+    return df
+
+
+def run_eval_mode_reset_validation(
+    config: CAPA5Config,
+    *,
+    datasets: Optional[List[str]] = None,
+    split_override: int = 2,
+    scoring_mode: Optional[str] = None,
+) -> pd.DataFrame:
+    target_dataset = datasets[0] if datasets else next(iter(config.TEST_DATA_PATHS.keys()))
+    out_dir = os.path.join(config.SAVE_DIR, "eval_mode_comparison", "reset_validation")
+    os.makedirs(out_dir, exist_ok=True)
+
+    full_cfg = _clone_config_for_eval_mode(config, "full_capa", os.path.join(out_dir, "full_capa"))
+    CAPA5NotebookRunner(full_cfg).run_eval_mode_report(
+        datasets=[target_dataset],
+        split_override=split_override,
+        scoring_mode=scoring_mode,
+    )
+
+    raw_after_cfg = _clone_config_for_eval_mode(config, "raw_baseline", os.path.join(out_dir, "raw_after_full_capa"))
+    df_after = CAPA5NotebookRunner(raw_after_cfg).run_eval_mode_report(
+        datasets=[target_dataset],
+        split_override=split_override,
+        scoring_mode=scoring_mode,
+    )
+
+    raw_fresh_cfg = _clone_config_for_eval_mode(config, "raw_baseline", os.path.join(out_dir, "raw_fresh"))
+    df_fresh = CAPA5NotebookRunner(raw_fresh_cfg).run_eval_mode_report(
+        datasets=[target_dataset],
+        split_override=split_override,
+        scoring_mode=scoring_mode,
+    )
+
+    row_after = df_after.iloc[0].to_dict() if len(df_after) else {}
+    row_fresh = df_fresh.iloc[0].to_dict() if len(df_fresh) else {}
+    compare_cols = ["macro_auc", "micro_auc", "ece", "acc", "brier"]
+    result_row: Dict[str, object] = {
+        "dataset": target_dataset,
+        "same_process_mode_order": "full_capa -> raw_baseline",
+        "raw_after_run_dir": row_after.get("run_dir", ""),
+        "raw_fresh_run_dir": row_fresh.get("run_dir", ""),
+    }
+    for col in compare_cols:
+        a_val = float(row_after.get(col, np.nan))
+        b_val = float(row_fresh.get(col, np.nan))
+        result_row[f"{col}_after_full_capa"] = a_val
+        result_row[f"{col}_fresh"] = b_val
+        result_row[f"{col}_delta"] = a_val - b_val if np.isfinite(a_val) and np.isfinite(b_val) else np.nan
+
+    df = pd.DataFrame([result_row])
+    csv_path = os.path.join(out_dir, "reset_validation.csv")
+    df.to_csv(csv_path, index=False)
+    print(f"[Saved] {csv_path}")
+    return df
+
+
 if __name__ == "__main__":
     import argparse
 
@@ -6997,6 +8076,34 @@ if __name__ == "__main__":
         default=None,
         help="Optional output directory. If omitted, use config default SAVE_DIR.",
     )
+    parser.add_argument(
+        "--eval-mode",
+        type=str,
+        default="full_capa",
+        choices=list(EVAL_MODE_ORDER),
+        help="Explicit evaluation mode for the main evaluation path.",
+    )
+    parser.add_argument(
+        "--datasets",
+        type=str,
+        default="",
+        help="Optional comma-separated subset of datasets to evaluate, e.g. MIMIC or CheXpert,MIMIC.",
+    )
+    parser.add_argument(
+        "--compare-eval-modes",
+        action="store_true",
+        help="Run raw_baseline and full_capa sequentially with isolated runners.",
+    )
+    parser.add_argument(
+        "--include-preprocessed-baseline",
+        action="store_true",
+        help="Also include the optional preprocessed_baseline diagnostic row in --compare-eval-modes output.",
+    )
+    parser.add_argument(
+        "--validate-eval-reset",
+        action="store_true",
+        help="Run a same-process full_capa -> raw_baseline reset smoke test.",
+    )
     args = parser.parse_args()
     base_cfg = CAPA5Config(
         LABEL_SPACE=str(args.label_space),
@@ -7008,6 +8115,7 @@ if __name__ == "__main__":
         PARAM_PROFILE=str(args.param_profile),
         LABEL_SPACE=str(args.label_space),
         SOURCE_LABEL_ORDER_PROFILE=str(args.source_label_order_profile),
+        EVAL_MODE=str(args.eval_mode),
         DEBUG=bool(args.debug),
         VERBOSE=bool(args.debug),
         PRINT_SUMMARY=False,
@@ -7101,68 +8209,96 @@ if __name__ == "__main__":
         GO_ML_HUBER_WARMUP_STEPS=max(0, int(args.go_ml_huber_warmup_steps)),
         CAPAV1_DUALTRACK_ENABLE_ABSTAIN=(str(args.dualtrack_abstain).lower() == "on"),
         CAPAV1_DUALTRACK_ABSTAIN_CONF=min(0.99, max(0.0, float(args.dualtrack_abstain_conf))),
+        ENTRY_SCRIPT=ENTRY_SCRIPT_PATH,
         SAVE_DIR=(str(args.save_dir) if args.save_dir else base_cfg.SAVE_DIR),
     )
-    runner = CAPA5NotebookRunner(config)
+    selected_datasets = [item.strip() for item in str(args.datasets).split(",") if item.strip()] or None
+    legacy_mode_requested = bool(
+        args.compare_softmax
+        or args.compare_per_dataset_capa
+    )
 
-    if config.VERBOSE:
-        print("[Checks] Quick sanity checks")
-        for path in [config.CALIB_DATA_PATH, config.TRAIN_DATA_PATH] + list(config.TEST_DATA_PATHS.values()):
-            if not os.path.exists(path):
-                print(f"  [WARN] Missing path: {path}")
-                continue
-            z, y, is_multi = runner._load_data(path, is_calibration=('calib' in path.lower()))
-            D = z.shape[1]
-            print(f"  {os.path.basename(path)} -> N={len(z)}, D={D}, labels_present={y is not None}, multi={is_multi}")
-
-    runner._build_prototypes()
-    if config.VERBOSE:
-        print("  prototypes raw/processed shapes:", runner.t_raw_pooled_raw.shape, runner.t_raw_pooled.shape)
-        assert runner.t_raw_pooled.shape == runner.t_raw_pooled_raw.shape
-
-    # Ensure minimal state for diagnostics
-    if runner.support_counts is None:
-        runner.support_counts = torch.ones(len(runner.config.ORDERED_CLASS_NAMES), device=runner.device) * runner.config.N_MIN_SUPPORT_FOR_ACTIVE
-    if runner.image_centroids is None:
-        runner.image_centroids = runner.t_raw_pooled.clone()
-    if runner.current_R is None:
-        runner.current_R = torch.eye(runner.t_raw_pooled.shape[1], device=runner.device)
-
-    if config.VERBOSE and runner.W_zca is not None:
-        WT = runner.W_zca.cpu().numpy()
-        I_approx = WT @ np.linalg.pinv(WT)
-        print("  ZCA approx identity max_err:", np.max(np.abs(I_approx - np.eye(I_approx.shape[0]))))
-
-    d = runner.t_raw_pooled.shape[1]
-    I = torch.eye(d, device=runner.device)
-    if config.VERBOSE:
-        Rtest = runner._solve_procrustes()
-        ortho_err = torch.norm(Rtest @ Rtest.T - I).item()
-        print("  Procrustes R ortho_err:", ortho_err)
-        assert ortho_err < 1e-3, "Procrustes R not sufficiently orthogonal"
-    
-    # Run full pipeline to freeze R and save state
-    runner.run_pipeline()
-
-    # Final manuscript validation with locked scales/priors and plotting
-    if args.compare_softmax:
-        rows_mixed = runner.run_manuscript_validation(scoring_mode="mixed", sim_source=config.SIM_SOURCE)
-        rows_softmax = runner.run_manuscript_validation(scoring_mode="softmax", sim_source=config.SIM_SOURCE)
-        runner.print_scoring_mode_comparison(rows_mixed, rows_softmax)
-        rows_selected = rows_mixed if config.SCORING_MODE == "mixed" else rows_softmax
-        runner.print_final_gate_summary(rows_selected, sim_source=config.SIM_SOURCE)
-        runner.print_three_way_auc_summary(rows_selected)
-        if args.compare_per_dataset_capa:
-            runner.run_shared_vs_per_dataset_capa(rows_selected, scoring_mode=config.SCORING_MODE)
-    else:
-        final_rows = runner.run_manuscript_validation(
+    if args.compare_eval_modes:
+        run_eval_mode_comparison(
+            config,
+            datasets=selected_datasets,
+            split_override=2,
             scoring_mode=config.SCORING_MODE,
-            sim_source=config.SIM_SOURCE,
+            include_preprocessed_baseline=bool(args.include_preprocessed_baseline),
         )
-        runner.print_final_gate_summary(final_rows, sim_source=config.SIM_SOURCE)
-        runner.print_three_way_auc_summary(final_rows)
-        if args.compare_per_dataset_capa:
-            runner.run_shared_vs_per_dataset_capa(final_rows, scoring_mode=config.SCORING_MODE)
+    elif not legacy_mode_requested:
+        runner = CAPA5NotebookRunner(config)
+        runner.run_eval_mode_report(
+            datasets=selected_datasets,
+            split_override=2,
+            scoring_mode=config.SCORING_MODE,
+        )
+    else:
+        runner = CAPA5NotebookRunner(config)
+
+        if config.VERBOSE:
+            print("[Checks] Quick sanity checks")
+            for path in [config.CALIB_DATA_PATH, config.TRAIN_DATA_PATH] + list(config.TEST_DATA_PATHS.values()):
+                if not os.path.exists(path):
+                    print(f"  [WARN] Missing path: {path}")
+                    continue
+                z, y, is_multi = runner._load_data(path, is_calibration=('calib' in path.lower()))
+                D = z.shape[1]
+                print(f"  {os.path.basename(path)} -> N={len(z)}, D={D}, labels_present={y is not None}, multi={is_multi}")
+
+        runner._build_prototypes()
+        if config.VERBOSE:
+            print("  prototypes raw/processed shapes:", runner.t_raw_pooled_raw.shape, runner.t_raw_pooled.shape)
+            assert runner.t_raw_pooled.shape == runner.t_raw_pooled_raw.shape
+
+        if runner.support_counts is None:
+            runner.support_counts = torch.ones(len(runner.config.ORDERED_CLASS_NAMES), device=runner.device) * runner.config.N_MIN_SUPPORT_FOR_ACTIVE
+        if runner.image_centroids is None:
+            runner.image_centroids = runner.t_raw_pooled.clone()
+        if runner.current_R is None:
+            runner.current_R = torch.eye(runner.t_raw_pooled.shape[1], device=runner.device)
+
+        if config.VERBOSE and runner.W_zca is not None:
+            WT = runner.W_zca.cpu().numpy()
+            I_approx = WT @ np.linalg.pinv(WT)
+            print("  ZCA approx identity max_err:", np.max(np.abs(I_approx - np.eye(I_approx.shape[0]))))
+
+        d = runner.t_raw_pooled.shape[1]
+        I = torch.eye(d, device=runner.device)
+        if config.VERBOSE:
+            Rtest = runner._solve_procrustes()
+            ortho_err = torch.norm(Rtest @ Rtest.T - I).item()
+            print("  Procrustes R ortho_err:", ortho_err)
+            assert ortho_err < 1e-3, "Procrustes R not sufficiently orthogonal"
+
+        runner.run_pipeline()
+
+        if args.compare_softmax:
+            rows_mixed = runner.run_manuscript_validation(scoring_mode="mixed", sim_source=config.SIM_SOURCE)
+            rows_softmax = runner.run_manuscript_validation(scoring_mode="softmax", sim_source=config.SIM_SOURCE)
+            runner.print_scoring_mode_comparison(rows_mixed, rows_softmax)
+            rows_selected = rows_mixed if config.SCORING_MODE == "mixed" else rows_softmax
+            runner.print_final_gate_summary(rows_selected, sim_source=config.SIM_SOURCE)
+            runner.print_three_way_auc_summary(rows_selected)
+            if args.compare_per_dataset_capa:
+                runner.run_shared_vs_per_dataset_capa(rows_selected, scoring_mode=config.SCORING_MODE)
+        else:
+            final_rows = runner.run_manuscript_validation(
+                scoring_mode=config.SCORING_MODE,
+                sim_source=config.SIM_SOURCE,
+            )
+            runner.print_final_gate_summary(final_rows, sim_source=config.SIM_SOURCE)
+            runner.print_three_way_auc_summary(final_rows)
+            if args.compare_per_dataset_capa:
+                runner.run_shared_vs_per_dataset_capa(final_rows, scoring_mode=config.SCORING_MODE)
+
+    if args.validate_eval_reset:
+        run_eval_mode_reset_validation(
+            config,
+            datasets=selected_datasets,
+            split_override=2,
+            scoring_mode=config.SCORING_MODE,
+        )
     if str(args.prompt_stage_isolation).lower() == "on":
         run_prompt_stage_isolation_analysis(config)
     if str(args.site_expert_analysis).lower() == "on":
