@@ -8,8 +8,9 @@ The default mainline is:
 
 - `chexpert5` label space
 - CheXpert-5 target-aware train/calibration data materialized from `data_train.pkl`
-- `GT support -> order-free multi-label residualization -> residual-centroid EMA -> guarded Procrustes`
-- `legacy-safe` prompt bank
+- `GT support -> order-free multi-label residualization -> residual-centroid EMA`
+- `disc-axis Procrustes -> guarded residual local slerp -> logit-level prompt-bank readout`
+- shift-gate fallback to the no-centering safety path for high calibration/test mean shift
 - `cache=off`
 
 ## How do I run it?
@@ -87,11 +88,11 @@ Current mainline results relative to the frozen BioMedCLIP zero-shot baseline:
 
 | Dataset | BioMedCLIP Baseline | CAPAv1-GT | Delta |
 | --- | ---: | ---: | ---: |
-| CheXpert | `0.5778` | `0.6441` | `+0.0663` |
-| MIMIC | `0.5717` | `0.6339` | `+0.0621` |
-| COVID | `0.7580` | `0.7226` | `-0.0354` |
-| RSNA | `0.6124` | `0.5594` | `-0.0530` |
+| CheXpert | `0.5778` | `0.6875` | `+0.1097` |
+| MIMIC | `0.5717` | `0.6484` | `+0.0767` |
+| COVID | `0.7580` | `0.7853` | `+0.0273` |
+| RSNA | `0.6124` | `0.6816` | `+0.0692` |
 
 These are macro-AUC values from:
-`results/mainline_target_aware_check/capav1_gt/eval_mode_comparison/eval_mode_comparison.csv`.
+`results/mainline_prompt_bank_route_v3/capav1_gt/eval_mode_comparison/eval_mode_comparison.csv`.
 This mainline is now aligned to the CheXpert-5/MIMIC-5 protocol; COVID/RSNA remain external binary stress checks.

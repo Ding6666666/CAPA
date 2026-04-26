@@ -821,6 +821,16 @@ class CAPA5Config:
     HARD_NEG_BETA: float = 0.15
     HARD_NEG_TOPK: int = 3
     HARD_NEG_TEMP: float = 0.07
+    ENABLE_DISC_AXIS_PROCRUSTES: bool = True
+    DISC_AXIS_NEG_LAMBDA: float = 0.25
+    DISABLE_SHARED_CENTERING: bool = False
+    ENABLE_RESIDUAL_LOCAL_SLERP: bool = True
+    RESIDUAL_LOCAL_TAU_DELTA_DEG: float = 25.0
+    RESIDUAL_LOCAL_N_MIN: int = 100
+    RESIDUAL_LOCAL_ETA: float = 0.20
+    RESIDUAL_LOCAL_LAMBDA_MAX: float = 0.08
+    RESIDUAL_LOCAL_ANGLE_FLOOR_DEG: float = 23.0
+    RESIDUAL_LOCAL_MIN_GAIN: float = 0.0
     MIN_CLASSES_FOR_ADAPTATION: int = -1
     
     INIT_TEMPERATURE: float = 0.590625
@@ -857,6 +867,18 @@ class CAPA5Config:
     CAPAV1_GUARDED_DUMP: bool = False
     CAPAV1_SMALLER_ALPHA_SCORE_TOL: float = 0.015
     CAPAV1_SMALLER_ALPHA_MIN_GAIN_FRAC: float = 0.40
+    ENABLE_PROMPT_BANK_READOUT: bool = True
+    PROMPT_BANK_READOUT_TEMP: float = 0.07
+    PROMPT_BANK_READOUT_CALIB_T: float = 2.0
+    PROMPT_BANK_READOUT_TEMPLATES: List[str] = field(default_factory=lambda: [
+        "This is an image of a chest X-ray depicting {finding}.",
+        "A chest X-ray showing {finding}.",
+        "There is evidence of {finding} on the chest X-ray.",
+        "Findings are consistent with {finding}.",
+        "The radiograph demonstrates {finding}.",
+    ])
+    ENABLE_CAPA_SHIFT_GATE: bool = True
+    CAPA_SHIFT_GATE_THRESHOLD: float = 0.22
     # Professor profile knobs / targets.
     PROF_TARGET_TOP1: float = 0.75
     PROF_EPSILON_GAP_PCT: float = 0.015
@@ -1016,6 +1038,19 @@ class CAPA5Config:
         priors = dict(PROMPT_BANK_PROFILE_PRIORS.get(self.PROMPT_BANK_PROFILE, DEFAULT_PROMPT_BUCKET_PRIORS))
         priors.update(dict(getattr(self, "PROMPT_BUCKET_PRIORS", {})))
         self.PROMPT_BUCKET_PRIORS = {str(k): float(v) for k, v in priors.items()}
+        self.DISC_AXIS_NEG_LAMBDA = max(0.0, float(getattr(self, "DISC_AXIS_NEG_LAMBDA", 0.25)))
+        self.RESIDUAL_LOCAL_TAU_DELTA_DEG = max(0.0, float(getattr(self, "RESIDUAL_LOCAL_TAU_DELTA_DEG", 25.0)))
+        self.RESIDUAL_LOCAL_N_MIN = max(1, int(getattr(self, "RESIDUAL_LOCAL_N_MIN", 100)))
+        self.RESIDUAL_LOCAL_ETA = max(0.0, float(getattr(self, "RESIDUAL_LOCAL_ETA", 0.20)))
+        self.RESIDUAL_LOCAL_LAMBDA_MAX = min(1.0, max(0.0, float(getattr(self, "RESIDUAL_LOCAL_LAMBDA_MAX", 0.08))))
+        self.RESIDUAL_LOCAL_ANGLE_FLOOR_DEG = min(179.0, max(0.0, float(getattr(self, "RESIDUAL_LOCAL_ANGLE_FLOOR_DEG", 23.0))))
+        self.RESIDUAL_LOCAL_MIN_GAIN = float(getattr(self, "RESIDUAL_LOCAL_MIN_GAIN", 0.0))
+        self.PROMPT_BANK_READOUT_TEMP = max(1e-4, float(getattr(self, "PROMPT_BANK_READOUT_TEMP", 0.07)))
+        self.PROMPT_BANK_READOUT_CALIB_T = max(1e-4, float(getattr(self, "PROMPT_BANK_READOUT_CALIB_T", 2.0)))
+        self.PROMPT_BANK_READOUT_TEMPLATES = [str(x) for x in list(getattr(self, "PROMPT_BANK_READOUT_TEMPLATES", []))]
+        if not self.PROMPT_BANK_READOUT_TEMPLATES:
+            self.PROMPT_BANK_READOUT_TEMPLATES = ["This is an image of a chest X-ray depicting {finding}."]
+        self.CAPA_SHIFT_GATE_THRESHOLD = max(0.0, float(getattr(self, "CAPA_SHIFT_GATE_THRESHOLD", 0.22)))
 
         go_ml_signal_mode = str(getattr(self, "GO_ML_SIGNAL_MODE", "")).strip().lower()
         if not go_ml_signal_mode:
@@ -1367,12 +1402,15 @@ class CAPA5NotebookRunner:
         elif (not spec.guardian) and guardian_requested:
             record_override("ENABLE_GO_GUARDIAN", True, False, f"{mode} disables guardian")
 
+        prompt_bank_readout_enabled = mode == "full_capa" and bool(getattr(self.config, "ENABLE_PROMPT_BANK_READOUT", True))
         dual_track_enabled = bool(spec.dual_track)
+        if prompt_bank_readout_enabled:
+            dual_track_enabled = False
         if (not spec.dual_track) and bool(getattr(self.config, "CAPAV1_DUALTRACK_ENABLE_ABSTAIN", False)):
             record_override("CAPAV1_DUALTRACK_ENABLE_ABSTAIN", True, False, f"{mode} disables dual-track routing")
 
         cache_requested = str(getattr(self.config, "CACHE_MODE", "off")).strip().lower() == "gated"
-        cache_enabled = bool(spec.cache) and bool(cache_requested)
+        cache_enabled = bool(spec.cache) and bool(cache_requested) and (not prompt_bank_readout_enabled)
         if (not spec.cache) and cache_requested:
             record_override("CACHE_MODE", "gated", "off", f"{mode} disables cache")
 
@@ -1391,7 +1429,7 @@ class CAPA5NotebookRunner:
                 record_override("TAU_PRIOR", prior_requested, 0.0, f"{mode} disables prior correction")
 
         soft_fusion_requested = bool(getattr(self.config, "ENABLE_CAPA_BASELINE_SOFT_FUSION", False))
-        soft_fusion_enabled = bool(spec.soft_fusion) and soft_fusion_requested
+        soft_fusion_enabled = bool(spec.soft_fusion) and soft_fusion_requested and (not prompt_bank_readout_enabled)
         if (not spec.soft_fusion) and soft_fusion_requested:
             record_override(
                 "ENABLE_CAPA_BASELINE_SOFT_FUSION",
@@ -1444,10 +1482,18 @@ class CAPA5NotebookRunner:
             rho_effective = 0.88
 
         final_logits_source = str(spec.final_logits_source)
+        if mode == "full_capa" and bool(getattr(self.config, "ENABLE_DISC_AXIS_PROCRUSTES", True)):
+            final_logits_source = "disc_axis"
+        if mode == "full_capa" and bool(getattr(self.config, "ENABLE_RESIDUAL_LOCAL_SLERP", True)):
+            final_logits_source = f"{final_logits_source}+residual_local_slerp"
+        if mode == "full_capa" and bool(getattr(self.config, "ENABLE_PROMPT_BANK_READOUT", True)):
+            final_logits_source = f"{final_logits_source}+logit_prompt_bank"
         if dual_track_enabled:
             final_logits_source = f"{final_logits_source}+dualtrack"
         if cache_enabled:
             final_logits_source = f"{final_logits_source}+cache"
+        if mode == "full_capa" and bool(getattr(self.config, "ENABLE_CAPA_SHIFT_GATE", True)):
+            final_logits_source = f"{final_logits_source}+shift_gate"
 
         return {
             "eval_mode": mode,
@@ -1566,6 +1612,8 @@ class CAPA5NotebookRunner:
         self.t_align_base = None
         self.t_paraphrases = []
         self.current_R = None; self.image_centroids = None
+        self.disc_neg_centroids = None
+        self.disc_neg_counts = None
         self.support_counts = None; self.rejected_counts = None; self.prior_counts = None; self.b_c = None
         self.is_frozen = False; self.R_frozen = None
         self.cache_keys = None
@@ -1577,6 +1625,8 @@ class CAPA5NotebookRunner:
         self.last_cache_eval_info = {}
         self.last_dualtrack_eval_info = {}
         self.final_alignment_stats = {}
+        self.residual_local_slerp_info: List[Dict[str, object]] = []
+        self.last_shift_gate_info: Dict[str, object] = {}
         self.max_leverage_info = "N/A"
         self.R_last_good = None
         self.centroids_last_good = None
@@ -1792,6 +1842,8 @@ class CAPA5NotebookRunner:
         return z.to(self.device), y, is_multi
             
     def _apply_preprocessing(self, z, mean_vec):
+        if bool(getattr(self.config, "DISABLE_SHARED_CENTERING", False)):
+            return self._l2_norm(z)
         if mean_vec is None: return self._l2_norm(z)
         z_centered = z - mean_vec
         if self.config.USE_ZCA_WHITEN and self.W_zca is not None:
@@ -1843,6 +1895,8 @@ class CAPA5NotebookRunner:
         self.current_R = torch.eye(d, device=self.device)
         self.R_frozen = torch.eye(d, device=self.device)
         self.image_centroids = proto_ref.clone()
+        self.disc_neg_centroids = proto_ref.clone()
+        self.disc_neg_counts = torch.zeros(n_cls, device=self.device)
         self.support_counts = torch.zeros(n_cls, device=self.device)
         self.rejected_counts = torch.zeros_like(self.support_counts)
         self.prior_counts = torch.zeros_like(self.support_counts)
@@ -1875,8 +1929,12 @@ class CAPA5NotebookRunner:
         aligned = self._refresh_aligned_text()
         if not isinstance(aligned, torch.Tensor):
             raise RuntimeError(f"{mode} requires aligned text prototypes.")
+        source = "t_aligned_text"
+        if bool(getattr(self.config, "ENABLE_RESIDUAL_LOCAL_SLERP", True)):
+            aligned = self._build_residual_local_text(aligned)
+            source = "t_aligned_text+residual_local_slerp"
         baseline_t = self.t_processed_text.clone() if isinstance(self.t_processed_text, torch.Tensor) else None
-        return aligned.clone(), baseline_t, "t_aligned_text"
+        return aligned.clone(), baseline_t, source
 
     def _set_eval_bias_for_prototypes(self, t_protos: torch.Tensor) -> None:
         if self._mode_uses_prior_correction() and isinstance(self.prior_counts, torch.Tensor):
@@ -2454,6 +2512,75 @@ class CAPA5NotebookRunner:
         w1 = np.sin(lam * theta) / sin_theta
         out = float(w0) * a + float(w1) * b
         return self._l2_norm(out)
+
+    def _min_interclass_angle_deg(self, t: torch.Tensor) -> float:
+        n_cls = int(t.shape[0])
+        if n_cls <= 1:
+            return float("nan")
+        sims = torch.matmul(self._l2_norm(t), self._l2_norm(t).T)
+        sims = sims.masked_fill(torch.eye(n_cls, dtype=torch.bool, device=self.device), -1.0)
+        max_cos = float(torch.max(sims).item())
+        return float(np.degrees(np.arccos(np.clip(max_cos, -1.0, 1.0))))
+
+    def _build_residual_local_text(self, t0: torch.Tensor) -> torch.Tensor:
+        self.residual_local_slerp_info = []
+        if not bool(getattr(self.config, "ENABLE_RESIDUAL_LOCAL_SLERP", True)):
+            return t0
+        if not isinstance(self.image_centroids, torch.Tensor) or not isinstance(self.support_counts, torch.Tensor):
+            return t0
+
+        tau_rad = float(np.radians(float(getattr(self.config, "RESIDUAL_LOCAL_TAU_DELTA_DEG", 25.0))))
+        n_min = int(getattr(self.config, "RESIDUAL_LOCAL_N_MIN", 100))
+        eta = float(getattr(self.config, "RESIDUAL_LOCAL_ETA", 0.20))
+        lam_max = float(getattr(self.config, "RESIDUAL_LOCAL_LAMBDA_MAX", 0.08))
+        floor_cos = float(np.cos(np.radians(float(getattr(self.config, "RESIDUAL_LOCAL_ANGLE_FLOOR_DEG", 23.0)))))
+        min_gain = float(getattr(self.config, "RESIDUAL_LOCAL_MIN_GAIN", 0.0))
+        mu = self._l2_norm(self.image_centroids)
+        t1 = t0.clone()
+        class_names = list(self.config.ORDERED_CLASS_NAMES)
+        min_angle_before = self._min_interclass_angle_deg(t0)
+
+        for c_idx in range(int(t0.shape[0])):
+            cos_before = float(torch.clamp(torch.dot(self._l2_norm(t0[c_idx]), self._l2_norm(mu[c_idx])), -1.0, 1.0).item())
+            delta_rad = float(np.arccos(np.clip(cos_before, -1.0, 1.0)))
+            support = float(self.support_counts[c_idx].item())
+            residual_ok = bool(delta_rad > tau_rad)
+            support_ok = bool(support >= n_min)
+            alpha_cand = min(lam_max, eta * delta_rad) if residual_ok and support_ok else 0.0
+            cand = self._slerp_unit(t0[c_idx], mu[c_idx], alpha_cand) if alpha_cand > 0.0 else t0[c_idx]
+            cos_after = float(torch.clamp(torch.dot(self._l2_norm(cand), self._l2_norm(mu[c_idx])), -1.0, 1.0).item())
+            gain = cos_after - cos_before
+            tmp = t1.clone()
+            tmp[c_idx] = cand
+            off = torch.matmul(self._l2_norm(tmp), self._l2_norm(tmp).T)
+            off = off.masked_fill(torch.eye(tmp.shape[0], dtype=torch.bool, device=self.device), -1.0)
+            max_pair_cos = float(torch.max(off).item())
+            gain_ok = bool(gain > min_gain)
+            angle_ok = bool(max_pair_cos <= floor_cos)
+            moved = bool(alpha_cand > 0.0 and gain_ok and angle_ok)
+            if moved:
+                t1[c_idx] = cand
+            self.residual_local_slerp_info.append(
+                {
+                    "class": class_names[c_idx] if c_idx < len(class_names) else str(c_idx),
+                    "support_count": support,
+                    "residual_deg": float(np.degrees(delta_rad)),
+                    "alpha": float(alpha_cand if moved else 0.0),
+                    "candidate_alpha": float(alpha_cand),
+                    "cos_before": cos_before,
+                    "cos_after_candidate": cos_after,
+                    "paired_cosine_gain": gain,
+                    "residual_ok": residual_ok,
+                    "support_ok": support_ok,
+                    "gain_ok": gain_ok,
+                    "angle_ok": angle_ok,
+                    "moved": moved,
+                    "max_pair_cos_after_candidate": max_pair_cos,
+                    "min_angle_before_deg": min_angle_before,
+                    "min_angle_after_running_deg": self._min_interclass_angle_deg(t1),
+                }
+            )
+        return self._l2_norm(t1)
 
     def _build_slerp_rotation_candidate(self, R_seed: torch.Tensor, alpha: float) -> Optional[Tuple[torch.Tensor, float]]:
         if not bool(getattr(self.config, "ENABLE_CAPAV1_GUARDED_SLERP", False)):
@@ -3221,6 +3348,77 @@ class CAPA5NotebookRunner:
         )
         return logits
 
+    def _mode_uses_prompt_bank_readout(self) -> bool:
+        return (
+            self._current_eval_mode() == "full_capa"
+            and bool(getattr(self.config, "ENABLE_PROMPT_BANK_READOUT", True))
+            and (not bool(getattr(self.config, "DISABLE_SHARED_CENTERING", False)))
+        )
+
+    def _encode_prompt_bank_readout_groups(self) -> List[torch.Tensor]:
+        classes = list(self.config.ORDERED_CLASS_NAMES)
+        templates = list(getattr(self.config, "PROMPT_BANK_READOUT_TEMPLATES", []))
+        groups: List[torch.Tensor] = []
+        for cls_name in classes:
+            prompts = [str(t).replace("{finding}", cls_name.lower()) for t in templates]
+            raw = self._encode_text(prompts)
+            proc = self._apply_preprocessing(raw, self.zT_mean) if self._mode_uses_image_preprocessing() else raw
+            proc = self._l2_norm(proc)
+            if isinstance(self.R_frozen, torch.Tensor):
+                proc = self._l2_norm(torch.matmul(proc, self.R_frozen.T))
+            groups.append(proc)
+        return groups
+
+    def _residual_local_alpha_by_class(self) -> Dict[str, float]:
+        if not self.residual_local_slerp_info:
+            aligned = self._refresh_aligned_text()
+            if isinstance(aligned, torch.Tensor):
+                self._build_residual_local_text(aligned)
+        return {str(row.get("class")): float(row.get("alpha", 0.0)) for row in self.residual_local_slerp_info}
+
+    def _compose_prompt_bank_readout_logits(self, z_embed: torch.Tensor) -> torch.Tensor:
+        groups = self._encode_prompt_bank_readout_groups()
+        alpha_by_class = self._residual_local_alpha_by_class()
+        mu = self._l2_norm(self.image_centroids) if isinstance(self.image_centroids, torch.Tensor) else None
+        tau = max(1e-4, float(getattr(self.config, "PROMPT_BANK_READOUT_TEMP", 0.07)))
+        logits: List[torch.Tensor] = []
+        for c_idx, group in enumerate(groups):
+            cls_name = self.config.ORDERED_CLASS_NAMES[c_idx] if c_idx < len(self.config.ORDERED_CLASS_NAMES) else str(c_idx)
+            alpha = float(alpha_by_class.get(str(cls_name), 0.0))
+            if alpha > 0.0 and isinstance(mu, torch.Tensor):
+                group = torch.stack([self._slerp_unit(vec, mu[c_idx], alpha) for vec in group], dim=0)
+            sims = torch.matmul(z_embed, group.T)
+            logits.append(tau * torch.logsumexp(sims / tau, dim=1))
+        return torch.stack(logits, dim=1)
+
+    def _compute_metrics_from_logits(
+        self,
+        logits: torch.Tensor,
+        y_true,
+        is_multi: bool,
+        *,
+        calib_T: float,
+        dataset_name: Optional[str],
+        scoring_mode: Optional[str],
+    ) -> Dict[str, float]:
+        scores_rank = self._predict_probs(
+            logits,
+            calib_T=1.0,
+            is_multi=bool(is_multi),
+            dataset_name=dataset_name,
+            scoring_mode=scoring_mode,
+            ranking=True,
+        ).detach().cpu().numpy()
+        probs_cal = self._predict_probs(
+            logits,
+            calib_T=float(calib_T),
+            is_multi=bool(is_multi),
+            dataset_name=dataset_name,
+            scoring_mode=scoring_mode,
+            ranking=False,
+        ).detach().cpu().numpy()
+        return self._compute_metrics_from_prob_arrays(y_true, scores_rank, probs_cal, is_multi=bool(is_multi))
+
     def _predict_probs(
         self,
         logits: torch.Tensor,
@@ -3499,6 +3697,28 @@ class CAPA5NotebookRunner:
             out[:, :n_use] = torch.tensor(y_arr[:, :n_use] > 0, dtype=torch.bool, device=self.device)
         return out
 
+    def _ensure_disc_axis_negative_state(self, n_cls: int, dtype: torch.dtype, t_aligned: torch.Tensor) -> None:
+        if (
+            not isinstance(self.disc_neg_centroids, torch.Tensor)
+            or int(self.disc_neg_centroids.shape[0]) != int(n_cls)
+        ):
+            self.disc_neg_centroids = t_aligned[:n_cls].detach().clone().to(self.device)
+            self.disc_neg_counts = torch.zeros(n_cls, device=self.device, dtype=dtype)
+
+    def _update_disc_axis_negative_centroids(self, z_batch: torch.Tensor, active_mask: torch.Tensor, t_aligned: torch.Tensor) -> None:
+        if not bool(getattr(self.config, "ENABLE_DISC_AXIS_PROCRUSTES", True)):
+            return
+        n_cls = int(t_aligned.shape[0])
+        self._ensure_disc_axis_negative_state(n_cls, z_batch.dtype, t_aligned)
+        for i in range(int(z_batch.shape[0])):
+            neg_indices = torch.where(~active_mask[i])[0].tolist()
+            img_vec = z_batch[i]
+            for c_idx in neg_indices:
+                self.disc_neg_counts[c_idx] += 1.0
+                eta = 1.0 / (float(self.config.KAPPA_EMA) + float(self.disc_neg_counts[c_idx].item()))
+                cur = self.disc_neg_centroids[c_idx]
+                self.disc_neg_centroids[c_idx] = self._l2_norm((1.0 - eta) * cur + eta * img_vec)
+
     def _update_centroids_gt_support(
         self,
         z_batch: torch.Tensor,
@@ -3579,6 +3799,7 @@ class CAPA5NotebookRunner:
                 update_count += 1
 
         rejected_labels = 0
+        self._update_disc_axis_negative_centroids(z_batch, gt_active_mask, t_aligned)
         return update_count, rejected_labels, support_labels
 
     def _solve_procrustes(self):
@@ -3591,6 +3812,18 @@ class CAPA5NotebookRunner:
         w = self._get_alignment_class_weights(mask)
         mu = self._l2_norm(self.image_centroids)
         t_raw = self._l2_norm(t_ref)
+        if bool(getattr(self.config, "ENABLE_DISC_AXIS_PROCRUSTES", True)):
+            if isinstance(self.disc_neg_centroids, torch.Tensor) and self.disc_neg_centroids.shape == mu.shape:
+                lam = max(0.0, float(getattr(self.config, "DISC_AXIS_NEG_LAMBDA", 0.25)))
+                mu_neg = self._l2_norm(self.disc_neg_centroids)
+                mu_axis = self._l2_norm(mu - lam * mu_neg)
+                m_cov = torch.matmul((w.view(-1, 1) * mu_axis).T, t_raw)
+                u, _, vh = torch.linalg.svd(m_cov)
+                diag = torch.ones(m_cov.shape[1], device=self.device)
+                if torch.det(torch.matmul(u, vh)) < 0:
+                    diag[-1] = -1
+                return torch.matmul(torch.matmul(u, torch.diag(diag)), vh)
+
         M_pos = torch.matmul((w.view(-1, 1) * mu).T, t_raw)
         M_cov = M_pos
 
@@ -5144,6 +5377,37 @@ class CAPA5NotebookRunner:
             "notes": str(self.eval_runtime.get("notes", "")),
         }
 
+    def _shift_gate_enabled(self) -> bool:
+        return (
+            self._current_eval_mode() == "full_capa"
+            and bool(getattr(self.config, "ENABLE_CAPA_SHIFT_GATE", True))
+            and (not bool(getattr(self.config, "DISABLE_SHARED_CENTERING", False)))
+        )
+
+    def _dataset_calibration_shift_l2(self, dataset_path: str) -> float:
+        z_cal, _, _ = self._load_data(self.config.CALIB_DATA_PATH, is_calibration=True, split_override=1)
+        cal_mean = self._l2_norm(self._l2_norm(z_cal).mean(dim=0, keepdim=True)).view(-1)
+        z_raw, _, _ = self._load_data(dataset_path, split_override=2)
+        ds_mean = self._l2_norm(self._l2_norm(z_raw).mean(dim=0, keepdim=True)).view(-1)
+        return float(torch.norm(ds_mean - cal_mean).item())
+
+    def _build_shift_gate_fallback_runner(self) -> "CAPA5NotebookRunner":
+        cfg = copy.deepcopy(self.config)
+        cfg.SAVE_DIR = os.path.join(self.config.SAVE_DIR, "shift_gate_no_center")
+        cfg.PRINT_SUMMARY = False
+        cfg.VERBOSE = False
+        cfg.DEBUG = False
+        cfg.DISABLE_SHARED_CENTERING = True
+        cfg.ENABLE_CAPA_SHIFT_GATE = False
+        cfg.ENABLE_PROMPT_BANK_READOUT = False
+        cfg.ENABLE_RESIDUAL_LOCAL_SLERP = False
+        cfg.ENABLE_DISC_AXIS_PROCRUSTES = False
+        runner = CAPA5NotebookRunner(cfg)
+        runner._init_state()
+        runner.eval_runtime = runner._build_eval_runtime()
+        runner.run_pipeline(run_stage4=False)
+        return runner
+
     def run_eval_mode_report(
         self,
         *,
@@ -5176,41 +5440,88 @@ class CAPA5NotebookRunner:
         audit_dir = os.path.join(self.config.SAVE_DIR, "audit")
         os.makedirs(audit_dir, exist_ok=True)
         report_rows: List[Dict[str, object]] = []
+        fallback_runner: Optional[CAPA5NotebookRunner] = None
 
         for dataset_name, path in self._iter_selected_test_datasets(datasets):
             if not os.path.exists(path):
                 continue
-            z_test_raw, y_test, is_multi = self._load_data(path, split_override=split_override)
+            eval_runner: CAPA5NotebookRunner = self
+            eval_t = t_eval
+            eval_baseline_t = baseline_t_protos
+            eval_prototype_source = prototype_source
+            path_choice = "centered"
+            shift_l2 = np.nan
+            if self._shift_gate_enabled():
+                shift_l2 = self._dataset_calibration_shift_l2(path)
+                if shift_l2 > float(getattr(self.config, "CAPA_SHIFT_GATE_THRESHOLD", 0.22)):
+                    if fallback_runner is None:
+                        fallback_runner = self._build_shift_gate_fallback_runner()
+                    eval_runner = fallback_runner
+                    eval_t, eval_baseline_t, eval_prototype_source = eval_runner._get_eval_prototype_bundle()
+                    path_choice = "no_center"
+
+            z_test_raw, y_test, is_multi = eval_runner._load_data(path, split_override=split_override)
             if y_test is None:
                 continue
-            z_test = self._prepare_eval_embeddings(z_test_raw)
-            self._set_eval_bias_for_prototypes(t_eval)
-            tau_eval = self._fit_eval_temperature(
-                dataset_name,
-                t_eval=t_eval,
-                baseline_t_protos=baseline_t_protos,
-                scoring_mode=score_mode,
-            )
-            stats = self._compute_metrics(
-                z_test,
-                y_test,
-                is_multi,
-                t_eval,
-                scale_override=scale,
-                temperature_override=tau_eval,
-                dataset_name=dataset_name,
-                scoring_mode=score_mode,
-                use_cache=self._is_cache_enabled(),
-                baseline_t_protos=baseline_t_protos,
-            )
-            audit = self._build_eval_audit_summary(
+            z_test = eval_runner._prepare_eval_embeddings(z_test_raw)
+            eval_runner._set_eval_bias_for_prototypes(eval_t)
+            eval_scale = eval_runner._effective_eval_scale()
+            if eval_runner._mode_uses_prompt_bank_readout():
+                tau_eval = float(getattr(eval_runner.config, "PROMPT_BANK_READOUT_CALIB_T", 2.0))
+                eval_runner.last_dualtrack_eval_info = {}
+                logits = eval_runner._compose_prompt_bank_readout_logits(z_test)
+                stats = eval_runner._compute_metrics_from_logits(
+                    logits,
+                    y_test,
+                    bool(is_multi),
+                    calib_T=tau_eval,
+                    dataset_name=dataset_name,
+                    scoring_mode=score_mode,
+                )
+                eval_prototype_source = f"{eval_prototype_source}+logit_prompt_bank"
+            else:
+                tau_eval = eval_runner._fit_eval_temperature(
+                    dataset_name,
+                    t_eval=eval_t,
+                    baseline_t_protos=eval_baseline_t,
+                    scoring_mode=score_mode,
+                )
+                stats = eval_runner._compute_metrics(
+                    z_test,
+                    y_test,
+                    is_multi,
+                    eval_t,
+                    scale_override=eval_scale,
+                    temperature_override=tau_eval,
+                    dataset_name=dataset_name,
+                    scoring_mode=score_mode,
+                    use_cache=eval_runner._is_cache_enabled(),
+                    baseline_t_protos=eval_baseline_t,
+                )
+            audit = eval_runner._build_eval_audit_summary(
                 dataset_name=dataset_name,
                 dataset_path=path,
                 split_override=split_override,
-                prototype_source=prototype_source,
+                prototype_source=eval_prototype_source,
                 temperature=tau_eval,
-                scale=scale,
-                run_dir=self.config.SAVE_DIR,
+                scale=eval_scale,
+                run_dir=eval_runner.config.SAVE_DIR,
+            )
+            audit.update(
+                {
+                    "route": "disc_axis_residual_local_prompt_bank_shift_gate"
+                    if self._current_eval_mode() == "full_capa"
+                    else self._current_eval_mode(),
+                    "path_choice": path_choice,
+                    "shift_l2": float(shift_l2) if np.isfinite(shift_l2) else None,
+                    "shift_threshold": float(getattr(self.config, "CAPA_SHIFT_GATE_THRESHOLD", 0.22)),
+                    "disc_axis_on": bool(getattr(eval_runner.config, "ENABLE_DISC_AXIS_PROCRUSTES", True)),
+                    "disc_axis_neg_lambda": float(getattr(eval_runner.config, "DISC_AXIS_NEG_LAMBDA", 0.25)),
+                    "residual_local_on": bool(getattr(eval_runner.config, "ENABLE_RESIDUAL_LOCAL_SLERP", True)),
+                    "prompt_bank_readout_on": bool(eval_runner._mode_uses_prompt_bank_readout()),
+                    "shared_centering_disabled": bool(getattr(eval_runner.config, "DISABLE_SHARED_CENTERING", False)),
+                    "residual_local_slerp_info": list(getattr(eval_runner, "residual_local_slerp_info", [])),
+                }
             )
             audit_path = os.path.join(audit_dir, f"{mode}_{dataset_name.lower()}_audit.json")
             with open(audit_path, "w", encoding="utf-8") as f:
@@ -5227,24 +5538,28 @@ class CAPA5NotebookRunner:
                 "acc": float(stats.get("Acc", np.nan)),
                 "brier": float(stats.get("Brier", np.nan)),
                 "temperature": float(tau_eval),
-                "scale": float(scale),
+                "scale": float(eval_scale),
                 "run_dir": str(self.config.SAVE_DIR),
-                "prototype_source": prototype_source,
+                "prototype_source": eval_prototype_source,
                 "final_logits_source": str(audit["final_logits_source"]),
-                "dual_track_used": bool(self.last_dualtrack_eval_info.get("enabled", False)),
-                "cache_used": bool(self._is_cache_enabled()),
-                "guardian_used": bool(self._is_go_guardian_enabled()),
-                "prior_correction_used": bool(self._mode_uses_prior_correction()),
-                "calibration_used": bool(self._mode_uses_calibration()),
+                "path_choice": path_choice,
+                "shift_l2": float(shift_l2) if np.isfinite(shift_l2) else np.nan,
+                "shift_threshold": float(getattr(self.config, "CAPA_SHIFT_GATE_THRESHOLD", 0.22)),
+                "dual_track_used": bool(eval_runner.last_dualtrack_eval_info.get("enabled", False)),
+                "cache_used": bool(eval_runner._is_cache_enabled()),
+                "guardian_used": bool(eval_runner._is_go_guardian_enabled()),
+                "prior_correction_used": bool(eval_runner._mode_uses_prior_correction()),
+                "calibration_used": bool(eval_runner._mode_uses_calibration()),
+                "prompt_bank_readout_used": bool(eval_runner._mode_uses_prompt_bank_readout()),
                 "notes": str(self.eval_runtime.get("notes", "")),
                 "audit_summary_path": audit_path,
             }
-            if self.last_dualtrack_eval_info:
-                row["dualtrack_aligned_rate"] = float(self.last_dualtrack_eval_info.get("aligned_rate", np.nan))
-                row["dualtrack_agree_rate"] = float(self.last_dualtrack_eval_info.get("agree_rate", np.nan))
-            if self.last_cache_eval_info:
-                row["cache_usage_rate"] = float(self.last_cache_eval_info.get("usage_rate", 0.0))
-                row["cache_mean_alpha"] = float(self.last_cache_eval_info.get("mean_alpha", 0.0))
+            if eval_runner.last_dualtrack_eval_info:
+                row["dualtrack_aligned_rate"] = float(eval_runner.last_dualtrack_eval_info.get("aligned_rate", np.nan))
+                row["dualtrack_agree_rate"] = float(eval_runner.last_dualtrack_eval_info.get("agree_rate", np.nan))
+            if eval_runner.last_cache_eval_info:
+                row["cache_usage_rate"] = float(eval_runner.last_cache_eval_info.get("usage_rate", 0.0))
+                row["cache_mean_alpha"] = float(eval_runner.last_cache_eval_info.get("mean_alpha", 0.0))
             report_rows.append(row)
 
         df = pd.DataFrame(report_rows)
