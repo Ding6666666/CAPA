@@ -570,6 +570,85 @@ STRUCTURED_PROMPT_PHRASE_BANK_CHEXPERT5_REPORT = {
         ],
     },
 }
+EARLY_TEXT_SUPPORT_SYNONYMS_CHEXPERT5 = {
+    "Atelectasis": [
+        "atelectasis",
+        "subsegmental atelectasis",
+        "linear atelectasis",
+        "basilar atelectasis",
+        "bibasal atelectatic change",
+        "linear atelectatic opacity",
+        "plate-like atelectatic opacity",
+        "low-volume atelectatic change",
+        "volume-loss related atelectatic opacity",
+        "dependent atelectasis",
+        "segmental atelectatic change",
+        "discoid atelectatic opacity",
+    ],
+    "Cardiomegaly": [
+        "cardiomegaly",
+        "mild cardiomegaly",
+        "moderate cardiomegaly",
+        "marked cardiomegaly",
+        "enlarged heart",
+        "enlarged cardiac silhouette",
+        "cardiac silhouette enlargement",
+        "prominent cardiac silhouette",
+        "cardiomediastinal enlargement",
+        "enlargement of the cardiac silhouette",
+        "increased cardiothoracic ratio",
+        "large cardiac silhouette",
+    ],
+    "Consolidation": [
+        "consolidation",
+        "airspace consolidation",
+        "focal airspace consolidation",
+        "patchy airspace consolidation",
+        "lobar consolidation",
+        "segmental consolidation",
+        "consolidative opacity",
+        "patchy consolidative opacity",
+        "dense airspace opacity",
+        "confluent airspace opacity",
+        "focal airspace opacity",
+        "basilar consolidative opacity",
+    ],
+    "Edema": [
+        "pulmonary edema",
+        "mild pulmonary edema",
+        "interstitial pulmonary edema",
+        "alveolar pulmonary edema",
+        "interstitial edema pattern",
+        "alveolar edema pattern",
+        "bilateral perihilar edema",
+        "pulmonary vascular congestion with edema",
+        "diffuse bilateral edema pattern",
+        "fluid overload pulmonary edema",
+        "bilateral hazy perihilar opacity from edema",
+        "diffuse interstitial pulmonary opacity from edema",
+    ],
+    "Pleural Effusion": [
+        "pleural effusion",
+        "small pleural effusion",
+        "moderate pleural effusion",
+        "bilateral pleural effusions",
+        "pleural fluid",
+        "layering pleural fluid",
+        "dependent pleural fluid",
+        "pleural fluid collection",
+        "blunting of the costophrenic angle",
+        "costophrenic angle blunting from pleural fluid",
+        "meniscus-like pleural opacity",
+        "basal pleural fluid opacity",
+    ],
+}
+EARLY_TEXT_SUPPORT_REPORT_TEMPLATES = [
+    "Impression: {finding}.",
+    "Findings: {finding}.",
+    "Chest radiograph demonstrates {finding}.",
+    "Frontal chest radiograph demonstrates {finding}.",
+    "Radiographic findings are consistent with {finding}.",
+]
 PROMPT_BUCKET_TEMPLATES_V2 = {
     "impression": [
         "Impression: {phrase}.",
@@ -754,6 +833,12 @@ class CAPA5Config:
     PROMPT_SCORE_TEMP: float = 0.12
     PROMPT_BUCKET_SCORE_TEMP: float = 0.18
     PROMPT_BUCKET_PRIORS: Dict[str, float] = field(default_factory=lambda: dict(DEFAULT_PROMPT_BUCKET_PRIORS))
+    ENABLE_EARLY_TEXT_PROMPT_SUPPORT: bool = True
+    EARLY_TEXT_PROMPT_TOP_K: int = 12
+    EARLY_TEXT_PROMPT_SELECTION_MODE: str = "margin"  # margin | own | mean_margin | soft_margin
+    EARLY_TEXT_PROMPT_ENTRY_MODE: str = "full"  # full | proto_only | mean_only
+    EARLY_TEXT_PROMPT_SOURCE: str = "report"
+    EARLY_TEXT_PROMPT_SELECTOR_SUBDIR: str = "early_text_prompt_selector"
     SITE_EXPERT_UNKNOWN_LOW_CONF: float = 0.60
     SITE_EXPERT_UNKNOWN_CONF_MARGIN: float = 0.0
     USE_ZCA_WHITEN: bool = False
@@ -1033,6 +1118,19 @@ class CAPA5Config:
             1,
             int(getattr(self, "PROMPT_RESOURCE_MAX_CANDIDATES", 24)),
         )
+        self.EARLY_TEXT_PROMPT_TOP_K = max(1, int(getattr(self, "EARLY_TEXT_PROMPT_TOP_K", 12)))
+        early_prompt_mode = str(getattr(self, "EARLY_TEXT_PROMPT_ENTRY_MODE", "full")).strip().lower()
+        if early_prompt_mode not in ("full", "proto_only", "mean_only"):
+            raise ValueError("Unsupported EARLY_TEXT_PROMPT_ENTRY_MODE. Use 'full', 'proto_only', or 'mean_only'.")
+        self.EARLY_TEXT_PROMPT_ENTRY_MODE = early_prompt_mode
+        early_select_mode = str(getattr(self, "EARLY_TEXT_PROMPT_SELECTION_MODE", "margin")).strip().lower()
+        if early_select_mode not in ("margin", "own", "mean_margin", "soft_margin"):
+            raise ValueError("Unsupported EARLY_TEXT_PROMPT_SELECTION_MODE. Use 'margin', 'own', 'mean_margin', or 'soft_margin'.")
+        self.EARLY_TEXT_PROMPT_SELECTION_MODE = early_select_mode
+        early_source = str(getattr(self, "EARLY_TEXT_PROMPT_SOURCE", "report")).strip().lower()
+        if early_source not in ("report",):
+            raise ValueError("Unsupported EARLY_TEXT_PROMPT_SOURCE. Use 'report'.")
+        self.EARLY_TEXT_PROMPT_SOURCE = early_source
         self.PROMPT_SCORE_TEMP = max(1e-3, float(getattr(self, "PROMPT_SCORE_TEMP", 0.12)))
         self.PROMPT_BUCKET_SCORE_TEMP = max(1e-3, float(getattr(self, "PROMPT_BUCKET_SCORE_TEMP", 0.18)))
         priors = dict(PROMPT_BANK_PROFILE_PRIORS.get(self.PROMPT_BANK_PROFILE, DEFAULT_PROMPT_BUCKET_PRIORS))
@@ -1627,6 +1725,8 @@ class CAPA5NotebookRunner:
         self.final_alignment_stats = {}
         self.residual_local_slerp_info: List[Dict[str, object]] = []
         self.last_shift_gate_info: Dict[str, object] = {}
+        self.early_text_prompt_support_info: Dict[str, object] = {}
+        self.early_text_prompt_groups: Dict[str, List[str]] = {}
         self.max_leverage_info = "N/A"
         self.R_last_good = None
         self.centroids_last_good = None
@@ -1657,6 +1757,132 @@ class CAPA5NotebookRunner:
         with torch.no_grad():
             text_inputs = self.tokenizer(texts).to(self.device)
             return self._l2_norm(self.clip_model.encode_text(text_inputs))
+
+    def _early_text_prompt_support_enabled(self) -> bool:
+        return (
+            self._current_eval_mode() == "full_capa"
+            and str(getattr(self.config, "LABEL_SPACE", "")).strip().lower() == "chexpert5"
+            and bool(getattr(self.config, "ENABLE_EARLY_TEXT_PROMPT_SUPPORT", True))
+        )
+
+    def _render_early_text_prompt_candidates(self) -> Dict[str, List[str]]:
+        groups: Dict[str, List[str]] = {}
+        for cls_name in list(self.config.ORDERED_CLASS_NAMES):
+            phrases = list(EARLY_TEXT_SUPPORT_SYNONYMS_CHEXPERT5.get(cls_name, [cls_name.lower()]))
+            prompts: List[str] = []
+            seen = set()
+            for phrase in phrases:
+                for template in EARLY_TEXT_SUPPORT_REPORT_TEMPLATES:
+                    text = " ".join(str(template).replace("{finding}", str(phrase)).strip().split())
+                    if text and text not in seen:
+                        seen.add(text)
+                        prompts.append(text)
+            groups[cls_name] = prompts
+        return groups
+
+    def _select_early_text_prompt_groups(self, selector: "CAPA5NotebookRunner") -> Tuple[Dict[str, List[str]], Dict[str, object]]:
+        if not isinstance(selector.image_centroids, torch.Tensor):
+            raise RuntimeError("Early text prompt selector is missing image centroids.")
+        if not isinstance(selector.R_frozen, torch.Tensor):
+            raise RuntimeError("Early text prompt selector is missing R_frozen.")
+        candidates = self._render_early_text_prompt_candidates()
+        refs = selector._l2_norm(selector.image_centroids)
+        top_k = max(1, int(getattr(self.config, "EARLY_TEXT_PROMPT_TOP_K", 12)))
+        select_mode = str(getattr(self.config, "EARLY_TEXT_PROMPT_SELECTION_MODE", "margin")).strip().lower()
+        selected: Dict[str, List[str]] = {}
+        selected_rows: List[Dict[str, object]] = []
+        for class_idx, cls_name in enumerate(list(self.config.ORDERED_CLASS_NAMES)):
+            prompts = list(candidates.get(cls_name, []))
+            if not prompts:
+                prompts = [f"Impression: {cls_name.lower()}."]
+            raw = selector._encode_text(prompts)
+            proc = selector._apply_preprocessing(raw, selector.zT_mean)
+            proc = selector._l2_norm(proc)
+            proc = selector._l2_norm(torch.matmul(proc, selector.R_frozen.T))
+            sims = torch.matmul(proc, refs.T)
+            own = sims[:, int(class_idx)]
+            other_mask = torch.ones(int(refs.shape[0]), dtype=torch.bool, device=sims.device)
+            other_mask[int(class_idx)] = False
+            other = sims[:, other_mask]
+            if select_mode == "own":
+                scores = own
+            elif select_mode == "mean_margin":
+                scores = own - other.mean(dim=1)
+            elif select_mode == "soft_margin":
+                tau = 0.07
+                scores = own - tau * torch.logsumexp(other / tau, dim=1)
+            else:
+                scores = own - other.max(dim=1).values
+            scores_np = scores.detach().cpu().numpy()
+            order = np.argsort(-scores_np)[: min(top_k, len(prompts))]
+            selected[cls_name] = [prompts[int(i)] for i in order]
+            for rank, idx in enumerate(order, start=1):
+                selected_rows.append(
+                    {
+                        "class": cls_name,
+                        "rank": int(rank),
+                        "score": float(scores_np[int(idx)]),
+                        "prompt": prompts[int(idx)],
+                    }
+                )
+        info = {
+            "enabled": True,
+            "source": str(getattr(self.config, "EARLY_TEXT_PROMPT_SOURCE", "report")),
+            "selection_mode": select_mode,
+            "top_k": int(top_k),
+            "entry_mode": str(getattr(self.config, "EARLY_TEXT_PROMPT_ENTRY_MODE", "full")),
+            "candidate_count_per_class": {k: int(len(v)) for k, v in candidates.items()},
+            "selected_count_per_class": {k: int(len(v)) for k, v in selected.items()},
+            "selected_prompts": selected,
+            "selected_rows": selected_rows,
+        }
+        return selected, info
+
+    def _ensure_early_text_prompt_support(self) -> None:
+        if not self._early_text_prompt_support_enabled():
+            self.early_text_prompt_support_info = {"enabled": False}
+            return
+        existing = getattr(self.config, "PROMPT_TEXT_EMBEDDING_GROUPS", None)
+        if isinstance(existing, dict) and existing:
+            self.early_text_prompt_groups = {str(k): list(v) for k, v in existing.items()}
+            self.early_text_prompt_support_info = {
+                "enabled": True,
+                "source": "preconfigured",
+                "entry_mode": str(getattr(self.config, "EARLY_TEXT_PROMPT_ENTRY_MODE", "full")),
+                "selected_count_per_class": {str(k): int(len(v)) for k, v in self.early_text_prompt_groups.items()},
+            }
+            setattr(self.config, "PROMPT_TEXT_ENTRY_MODE", str(getattr(self.config, "EARLY_TEXT_PROMPT_ENTRY_MODE", "full")))
+            return
+
+        selector_cfg = copy.deepcopy(self.config)
+        selector_cfg.ENABLE_EARLY_TEXT_PROMPT_SUPPORT = False
+        selector_cfg.PRINT_SUMMARY = False
+        selector_cfg.VERBOSE = False
+        selector_cfg.DEBUG = False
+        selector_cfg.SAVE_DIR = os.path.join(
+            str(self.config.SAVE_DIR),
+            str(getattr(self.config, "EARLY_TEXT_PROMPT_SELECTOR_SUBDIR", "early_text_prompt_selector")),
+        )
+        selector = CAPA5NotebookRunner(selector_cfg)
+        selector._init_state()
+        selector.eval_runtime = selector._build_eval_runtime()
+        selector.run_pipeline(run_stage4=False)
+
+        selected, info = self._select_early_text_prompt_groups(selector)
+        self.early_text_prompt_groups = selected
+        self.early_text_prompt_support_info = info
+        setattr(self.config, "PROMPT_TEXT_EMBEDDING_GROUPS", selected)
+        setattr(self.config, "PROMPT_TEXT_ENTRY_MODE", str(getattr(self.config, "EARLY_TEXT_PROMPT_ENTRY_MODE", "full")))
+        self.config.M = max(int(getattr(self.config, "M", 5)), int(getattr(self.config, "EARLY_TEXT_PROMPT_TOP_K", 12)))
+        out_dir = os.path.join(str(self.config.SAVE_DIR), "audit")
+        os.makedirs(out_dir, exist_ok=True)
+        with open(os.path.join(out_dir, "early_text_prompt_support.json"), "w", encoding="utf-8") as f:
+            json.dump(info, f, indent=2, ensure_ascii=True, default=_json_default)
+        self._log(
+            f"[PromptSupport] selected top-{int(getattr(self.config, 'EARLY_TEXT_PROMPT_TOP_K', 12))} "
+            "report prompts per class for early text prototype construction.",
+            always=True,
+        )
 
     def _find_embedding_col(self, cols):
         for c in cols:
@@ -2285,7 +2511,102 @@ class CAPA5NotebookRunner:
             self.t_aligned_text = base.clone()
         return self.t_aligned_text
 
+    def _get_text_entry_prompt_groups(self) -> Optional[Dict[str, List[str]]]:
+        groups = getattr(self.config, "PROMPT_TEXT_EMBEDDING_GROUPS", None)
+        if not isinstance(groups, dict) or not groups:
+            return None
+        return {str(k): [str(x) for x in list(v)] for k, v in groups.items()}
+
+    def _build_default_text_entry_raw_candidates(self, cls_name: str) -> torch.Tensor:
+        syns = list(self.config.MEDICAL_SYNONYM_MAP.get(cls_name, [cls_name]))
+        templates = list(self.config.TEMPLATES_PI)
+        target_m = 5
+        texts = [
+            templates[i % len(templates)].replace("{finding}", syns[i % len(syns)])
+            for i in range(target_m)
+        ]
+        return self._encode_text(texts)
+
+    def _repeat_or_clip_prompt_matrix(self, proc: torch.Tensor, target_m: int) -> torch.Tensor:
+        if int(proc.shape[0]) <= 0:
+            raise RuntimeError("Empty prompt candidate tensor.")
+        if int(proc.shape[0]) < target_m:
+            idx = [i % int(proc.shape[0]) for i in range(target_m)]
+            return proc[idx]
+        return proc[:target_m]
+
+    def _build_early_text_entry_prototypes(self, groups: Dict[str, List[str]]) -> bool:
+        entry_mode = str(getattr(self.config, "PROMPT_TEXT_ENTRY_MODE", getattr(self.config, "EARLY_TEXT_PROMPT_ENTRY_MODE", "full"))).strip().lower()
+        if entry_mode not in ("full", "proto_only", "mean_only"):
+            return False
+        classes = list(self.config.ORDERED_CLASS_NAMES)
+        default_raw_all: List[torch.Tensor] = []
+        bank_raw_all: List[torch.Tensor] = []
+        for cls_name in classes:
+            default_raw_all.append(self._build_default_text_entry_raw_candidates(cls_name))
+            prompts = list(groups.get(cls_name, []))
+            if not prompts:
+                prompts = [f"Impression: {cls_name.lower()}."]
+            bank_raw_all.append(self._encode_text(prompts))
+
+        default_proto_raw = torch.stack(
+            [self._l2_norm(raw.mean(dim=0, keepdim=True)).squeeze(0) for raw in default_raw_all]
+        )
+        bank_proto_raw = torch.stack(
+            [self._l2_norm(raw.mean(dim=0, keepdim=True)).squeeze(0) for raw in bank_raw_all]
+        )
+        default_zT_mean = default_proto_raw.mean(dim=0, keepdim=True)
+        bank_zT_mean = bank_proto_raw.mean(dim=0, keepdim=True)
+
+        self.t_zero_shot_base_raw = default_proto_raw
+        self.t_zero_shot_base = torch.stack(
+            [
+                self._l2_norm(self._apply_preprocessing(raw, default_zT_mean).mean(dim=0, keepdim=True)).squeeze(0)
+                for raw in default_raw_all
+            ]
+        )
+
+        if entry_mode == "full":
+            selected_raw_all = bank_raw_all
+            self.zT_mean = bank_zT_mean
+        elif entry_mode == "proto_only":
+            selected_raw_all = bank_raw_all
+            self.zT_mean = default_zT_mean
+        else:
+            selected_raw_all = default_raw_all
+            self.zT_mean = bank_zT_mean
+
+        target_m = max(1, int(getattr(self.config, "M", 5)))
+        final_raw_list: List[torch.Tensor] = []
+        final_proc_list: List[torch.Tensor] = []
+        prompt_matrix_list: List[torch.Tensor] = []
+        for raw in selected_raw_all:
+            proc = self._apply_preprocessing(raw, self.zT_mean)
+            final_raw_list.append(self._l2_norm(raw.mean(dim=0, keepdim=True)).squeeze(0))
+            final_proc_list.append(self._l2_norm(proc.mean(dim=0, keepdim=True)).squeeze(0))
+            prompt_matrix_list.append(self._repeat_or_clip_prompt_matrix(proc, target_m))
+
+        self.t_raw_pooled_raw = torch.stack(final_raw_list)
+        self.t_raw_pooled = torch.stack(final_proc_list)
+        base_ref = self._get_mode_alignment_reference()
+        self.t_align_base = base_ref.clone() if isinstance(base_ref, torch.Tensor) else self.t_raw_pooled.clone()
+        self._sync_named_prototypes()
+        self.cache_keys = None
+        self.cache_labels = None
+        self.cache_is_multi = False
+        self.cache_ready = False
+        self.cache_reference = None
+        self.cache_reference_ready = False
+        self.last_cache_eval_info = {}
+        t_reshaped_proc = torch.stack(prompt_matrix_list)
+        self.t_paraphrases = [self._l2_norm(t_reshaped_proc[:, m, :]) for m in range(target_m)]
+        return True
+
     def _build_prototypes(self):
+        entry_groups = self._get_text_entry_prompt_groups()
+        if entry_groups and self._build_early_text_entry_prototypes(entry_groups):
+            return
+
         classes = self.config.ORDERED_CLASS_NAMES
         legacy_base_raw_candidates: List[torch.Tensor] = []
         for cls_name in classes:
@@ -4299,6 +4620,7 @@ class CAPA5NotebookRunner:
         }
 
     def run_pipeline(self, *, run_stage4: bool = True):
+        self._ensure_early_text_prompt_support()
         z_cal = self._prepare_shared_feature_space()
         if not self._mode_uses_alignment():
             # Legacy deployment-only evaluation sweep kept dormant for the two-mode main path.
@@ -5370,6 +5692,14 @@ class CAPA5NotebookRunner:
             "prior_correction_on": bool(self._mode_uses_prior_correction()),
             "calibration_on": bool(self._mode_uses_calibration()),
             "final_logits_source": str(self.eval_runtime.get("final_logits_source", "")),
+            "early_text_prompt_support": {
+                "enabled": bool(getattr(self.config, "ENABLE_EARLY_TEXT_PROMPT_SUPPORT", True))
+                and bool(getattr(self.config, "PROMPT_TEXT_EMBEDDING_GROUPS", None)),
+                "top_k": int(getattr(self.config, "EARLY_TEXT_PROMPT_TOP_K", 12)),
+                "entry_mode": str(getattr(self.config, "EARLY_TEXT_PROMPT_ENTRY_MODE", "full")),
+                "selection_mode": str(getattr(self.config, "EARLY_TEXT_PROMPT_SELECTION_MODE", "margin")),
+                "info": dict(getattr(self, "early_text_prompt_support_info", {})),
+            },
             "metric_source": str(self.eval_runtime.get("metric_source", f"{Path(__file__).name}::_compute_metrics")),
             "run_dir": str(run_dir),
             "scale": float(scale),
@@ -5400,6 +5730,9 @@ class CAPA5NotebookRunner:
         cfg.DISABLE_SHARED_CENTERING = True
         cfg.ENABLE_CAPA_SHIFT_GATE = False
         cfg.ENABLE_PROMPT_BANK_READOUT = False
+        cfg.ENABLE_EARLY_TEXT_PROMPT_SUPPORT = False
+        if hasattr(cfg, "PROMPT_TEXT_EMBEDDING_GROUPS"):
+            delattr(cfg, "PROMPT_TEXT_EMBEDDING_GROUPS")
         cfg.ENABLE_RESIDUAL_LOCAL_SLERP = False
         cfg.ENABLE_DISC_AXIS_PROCRUSTES = False
         runner = CAPA5NotebookRunner(cfg)
@@ -5509,7 +5842,7 @@ class CAPA5NotebookRunner:
             )
             audit.update(
                 {
-                    "route": "disc_axis_residual_local_prompt_bank_shift_gate"
+                    "route": "early_text_support_disc_axis_residual_local_prompt_bank_shift_gate"
                     if self._current_eval_mode() == "full_capa"
                     else self._current_eval_mode(),
                     "path_choice": path_choice,
@@ -5518,6 +5851,12 @@ class CAPA5NotebookRunner:
                     "disc_axis_on": bool(getattr(eval_runner.config, "ENABLE_DISC_AXIS_PROCRUSTES", True)),
                     "disc_axis_neg_lambda": float(getattr(eval_runner.config, "DISC_AXIS_NEG_LAMBDA", 0.25)),
                     "residual_local_on": bool(getattr(eval_runner.config, "ENABLE_RESIDUAL_LOCAL_SLERP", True)),
+                    "early_text_prompt_support_on": bool(getattr(eval_runner.config, "ENABLE_EARLY_TEXT_PROMPT_SUPPORT", True))
+                    and bool(getattr(eval_runner.config, "PROMPT_TEXT_EMBEDDING_GROUPS", None)),
+                    "early_text_prompt_top_k": int(getattr(eval_runner.config, "EARLY_TEXT_PROMPT_TOP_K", 12)),
+                    "early_text_prompt_entry_mode": str(getattr(eval_runner.config, "EARLY_TEXT_PROMPT_ENTRY_MODE", "full")),
+                    "early_text_prompt_selection_mode": str(getattr(eval_runner.config, "EARLY_TEXT_PROMPT_SELECTION_MODE", "margin")),
+                    "early_text_prompt_support_info": dict(getattr(eval_runner, "early_text_prompt_support_info", {})),
                     "prompt_bank_readout_on": bool(eval_runner._mode_uses_prompt_bank_readout()),
                     "shared_centering_disabled": bool(getattr(eval_runner.config, "DISABLE_SHARED_CENTERING", False)),
                     "residual_local_slerp_info": list(getattr(eval_runner, "residual_local_slerp_info", [])),
@@ -6394,6 +6733,11 @@ class CAPA5NotebookRunner:
                 "Prompt_Pooling_Mode": str(getattr(self.config, "PROMPT_POOLING_MODE", "mean")),
                 "Prompt_Legacy_Mix": float(getattr(self.config, "PROMPT_LEGACY_MIX", 0.0)),
                 "Prompt_Class_Mix_Profile": str(getattr(self.config, "PROMPT_CLASS_MIX_PROFILE", "none")),
+                "Early_Text_Prompt_Support": bool(getattr(self.config, "ENABLE_EARLY_TEXT_PROMPT_SUPPORT", True))
+                and bool(getattr(self.config, "PROMPT_TEXT_EMBEDDING_GROUPS", None)),
+                "Early_Text_Prompt_TopK": int(getattr(self.config, "EARLY_TEXT_PROMPT_TOP_K", 12)),
+                "Early_Text_Prompt_Entry_Mode": str(getattr(self.config, "EARLY_TEXT_PROMPT_ENTRY_MODE", "full")),
+                "Early_Text_Prompt_Selection": str(getattr(self.config, "EARLY_TEXT_PROMPT_SELECTION_MODE", "margin")),
                 "Guarded_Slerp": bool(getattr(self.config, "ENABLE_CAPAV1_GUARDED_SLERP", False)),
                 "Guarded_Slerp_Lambda_Max": float(getattr(self.config, "CAPAV1_GUARDED_SLERP_LAMBDA_MAX", 0.0)),
                 "GO_Stage2": bool(getattr(self.config, "ENABLE_GO_GUARDIAN_STAGE2", False)),
@@ -7977,6 +8321,33 @@ if __name__ == "__main__":
         help="Softmax temperature for bucket-level weighting.",
     )
     parser.add_argument(
+        "--early-text-prompt-support",
+        type=str,
+        default="on",
+        choices=["on", "off"],
+        help="Use support-selected report prompts as early text-side semantic support.",
+    )
+    parser.add_argument(
+        "--early-text-prompt-top-k",
+        type=int,
+        default=12,
+        help="Number of support-selected report prompts per class for early text prototype construction.",
+    )
+    parser.add_argument(
+        "--early-text-prompt-selection",
+        type=str,
+        default="margin",
+        choices=["margin", "own", "mean_margin", "soft_margin"],
+        help="Support-side prompt selection score.",
+    )
+    parser.add_argument(
+        "--early-text-prompt-entry-mode",
+        type=str,
+        default="full",
+        choices=["full", "proto_only", "mean_only"],
+        help="Whether early prompts affect both zT_mean and prototypes, prototypes only, or text mean only.",
+    )
+    parser.add_argument(
         "--cache-mode",
         type=str,
         default="off",
@@ -8456,6 +8827,10 @@ if __name__ == "__main__":
         PROMPT_RESOURCE_MAX_CANDIDATES=max(1, int(args.prompt_max_candidates)),
         PROMPT_SCORE_TEMP=max(1e-3, float(args.prompt_score_temp)),
         PROMPT_BUCKET_SCORE_TEMP=max(1e-3, float(args.prompt_bucket_score_temp)),
+        ENABLE_EARLY_TEXT_PROMPT_SUPPORT=(str(args.early_text_prompt_support).lower() == "on"),
+        EARLY_TEXT_PROMPT_TOP_K=max(1, int(args.early_text_prompt_top_k)),
+        EARLY_TEXT_PROMPT_SELECTION_MODE=str(args.early_text_prompt_selection),
+        EARLY_TEXT_PROMPT_ENTRY_MODE=str(args.early_text_prompt_entry_mode),
         SITE_EXPERT_UNKNOWN_LOW_CONF=min(0.99, max(0.0, float(args.site_expert_low_conf))),
         SITE_EXPERT_UNKNOWN_CONF_MARGIN=max(0.0, float(args.site_expert_conf_margin)),
         SCORING_MODE=str(args.scoring_mode),
