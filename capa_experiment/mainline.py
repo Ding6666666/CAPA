@@ -23,7 +23,7 @@ from typing import Any, Dict, List, Tuple, Optional
 from scipy.optimize import minimize
 from scipy.special import logsumexp
 from scipy.stats import beta as beta_dist, norm
-from sklearn.metrics import roc_auc_score, f1_score, accuracy_score, roc_curve, auc
+from sklearn.metrics import roc_auc_score, accuracy_score, roc_curve, auc
 from sklearn.calibration import calibration_curve
 from sklearn.exceptions import UndefinedMetricWarning
 from dataclasses import dataclass, field
@@ -4885,6 +4885,25 @@ class CAPA5NotebookRunner:
 
         return ece * 100.0  # 杞负鐧惧垎姣?
 
+    @staticmethod
+    def _compute_standard_multitarget_accuracy(y_true, scores_rank, probs_cal) -> float:
+        y_arr = (np.asarray(y_true) > 0).astype(np.int32)
+        s_rank = np.asarray(scores_rank, dtype=np.float64)
+        p_cal = np.asarray(probs_cal, dtype=np.float64)
+        if y_arr.ndim != 2 or s_rank.ndim != 2 or p_cal.ndim != 2:
+            return np.nan
+        n = min(int(y_arr.shape[0]), int(s_rank.shape[0]), int(p_cal.shape[0]))
+        c = min(int(y_arr.shape[1]), int(s_rank.shape[1]), int(p_cal.shape[1]))
+        if n <= 0 or c <= 0:
+            return np.nan
+        y_arr = y_arr[:n, :c]
+        s_rank = s_rank[:n, :c]
+        p_cal = p_cal[:n, :c]
+        row_pos = y_arr.sum(axis=1)
+        if np.all(row_pos == 1):
+            return float(accuracy_score(y_arr.argmax(axis=1), s_rank.argmax(axis=1)))
+        return float(accuracy_score(y_arr, (p_cal > 0.5).astype(np.int32)))
+
     def _compute_metrics(
         self,
         z_test,
@@ -4960,7 +4979,11 @@ class CAPA5NotebookRunner:
                     pass
 
                 stats["ECE"] = self._compute_ece(y_eval, probs_cal_eval)
-                stats["Acc"] = f1_score(y_eval, (probs_cal_eval > 0.5).astype(int), average="macro", zero_division=0)
+                stats["Acc"] = self._compute_standard_multitarget_accuracy(
+                    y_eval,
+                    probs_rank_eval,
+                    probs_cal_eval,
+                )
                 stats["Brier"] = float(np.mean((probs_cal_eval - y_eval) ** 2))
 
                 if "DEBUG_AUC_CHECK" in os.environ:
@@ -5039,7 +5062,7 @@ class CAPA5NotebookRunner:
             except Exception:
                 pass
             stats["ECE"] = self._compute_ece(y_eval, cal_eval)
-            stats["Acc"] = float(f1_score(y_eval, (cal_eval > 0.5).astype(int), average="macro", zero_division=0))
+            stats["Acc"] = self._compute_standard_multitarget_accuracy(y_eval, rank_eval, cal_eval)
             stats["Top1_Median"] = float(np.median(cal_eval.max(axis=1)))
             stats["Brier"] = float(np.mean((cal_eval - y_eval) ** 2))
             return stats
